@@ -7,7 +7,7 @@ use std::{
         fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     rc::Rc,
     sync::mpsc,
     time::Duration,
@@ -20,19 +20,31 @@ use acp_thread::{
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentProfile, AgentProfileId};
 use anyhow::{Context as _, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use git::{
+    repository::{DiffType, RepoPath},
+    status::{FileStatus, StageStatus},
+};
 use gpui::{App, Entity, Global, Subscription, Task};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use util::rel_path::RelPath;
 
 use crate::agent_panel::{AgentPanel, CreateThreadOptions};
 use crate::conversation_view::ThreadView;
 use crate::{Agent, AgentThreadSource};
 
-const MAX_REQUEST_BYTES: u64 = 4096;
+const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_ACTIVITY_BYTES: usize = 256 * 1024;
 const MAX_APPROVAL_INPUT_BYTES: usize = 8192;
 const MAX_THREAD_TITLE_BYTES: usize = 128;
+const MAX_PROJECT_FILES: usize = 1000;
+const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
+const MAX_ATTACHMENTS: usize = 8;
+const MAX_DIFF_BYTES: usize = 512 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +69,8 @@ struct ProbeState {
     exposed_threads: RefCell<HashSet<String>>,
     subscriptions: RefCell<HashMap<String, Subscription>>,
     events: RefCell<HashMap<String, ThreadEvents>>,
+    diffs: RefCell<HashMap<String, DiffRecord>>,
+    change_operations: RefCell<HashMap<String, ChangeOperationRecord>>,
 }
 
 #[derive(Default)]
@@ -71,13 +85,38 @@ impl Global for ProbeGlobal {}
 
 struct SubmissionRecord {
     thread_id: String,
-    text: String,
+    payload_digest: String,
     outcome: &'static str,
 }
 
 struct CreationRecord {
     title: Option<String>,
     thread_id: Option<String>,
+}
+
+enum DiffRecord {
+    Loading {
+        revision: String,
+    },
+    Ready {
+        revision: String,
+        diff: String,
+        truncated: bool,
+    },
+    Failed {
+        revision: String,
+    },
+}
+
+struct ChangeOperationRecord {
+    payload_digest: String,
+    state: ChangeOperationState,
+}
+
+enum ChangeOperationState {
+    Running,
+    Succeeded,
+    Failed,
 }
 
 pub fn init(cx: &mut App) {
@@ -134,6 +173,8 @@ pub fn init(cx: &mut App) {
                 exposed_threads: RefCell::new(HashSet::new()),
                 subscriptions: RefCell::new(HashMap::new()),
                 events: RefCell::new(HashMap::new()),
+                diffs: RefCell::new(HashMap::new()),
+                change_operations: RefCell::new(HashMap::new()),
             },
         ))
     })();
@@ -291,7 +332,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             json!({
                 "instance_id": state.instance_id,
                 "epoch": state.epoch,
-                "capabilities": ["thread.list", "thread.create", "thread.snapshot", "thread.events", "thread.commands", "thread.settings", "thread.settings.update", "thread.send", "thread.cancel", "request.status"],
+                "capabilities": ["thread.list", "thread.create", "thread.snapshot", "thread.events", "thread.commands", "thread.settings", "thread.settings.update", "thread.send", "thread.attachments", "thread.cancel", "thread.approvals", "approval.respond", "project.files", "project.file", "changes.snapshot", "changes.diff", "changes.stage", "changes.unstage", "request.status"],
                 "provisional": true,
             }),
         ),
@@ -488,6 +529,12 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         "thread.commands" => command_list(&request, state, cx),
         "thread.settings" => thread_settings(&request, state, cx),
         "thread.settings.update" => update_thread_settings(&request, state, cx),
+        "project.files" => project_files(&request, state, cx),
+        "project.file" => project_file(&request, state, cx),
+        "changes.snapshot" => changes_snapshot(&request, state, cx),
+        "changes.diff" => changes_diff(&request, state, cx),
+        "changes.stage" => change_stage(&request, state, true, cx),
+        "changes.unstage" => change_stage(&request, state, false, cx),
         "thread.send" => send_request(&request, state, cx),
         "thread.cancel" => cancel_request(&request, state, cx),
         "thread.approvals" => approval_list(&request, state, cx),
@@ -987,6 +1034,584 @@ fn thread_settings_value(
     })
 }
 
+fn exposed_thread_for_request(
+    request: &ProbeRequest,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<Entity<AcpThread>, &'static str> {
+    if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
+        || request.params.get("epoch").and_then(Value::as_str) != Some(state.epoch.as_str())
+    {
+        return Err("INSTANCE_UNAVAILABLE");
+    }
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return Err("INVALID_REQUEST");
+    };
+    if !state.exposed_threads.borrow().contains(thread_id) {
+        return Err("THREAD_NOT_EXPOSED");
+    }
+    loaded_threads(&state.project_root, cx)
+        .into_iter()
+        .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
+        .ok_or("THREAD_NOT_EXPOSED")
+}
+
+fn exposed_worktree(
+    request: &ProbeRequest,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<Entity<worktree::Worktree>, &'static str> {
+    let thread = exposed_thread_for_request(request, state, cx)?;
+    let project = thread.read(cx).project().clone();
+    project
+        .read(cx)
+        .visible_worktrees(cx)
+        .find(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root)
+        .ok_or("INSTANCE_UNAVAILABLE")
+}
+
+fn excluded_remote_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path.components().any(|component| {
+        component.as_os_str().to_str().is_none_or(|part| {
+            part.starts_with('.') || matches!(part, "target" | "node_modules" | "__pycache__")
+        })
+    }) {
+        return true;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        file_name.as_str(),
+        "credentials" | "credentials.json" | "secrets.json" | "id_rsa" | "id_ed25519"
+    ) || matches!(
+        extension.as_str(),
+        "key" | "pem" | "p12" | "pfx" | "pyc" | "class" | "o" | "so"
+    )
+}
+
+fn safe_project_entry(
+    path: &str,
+    request: &ProbeRequest,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<PathBuf, &'static str> {
+    if path.is_empty() || path.len() > 1024 {
+        return Err("INVALID_REQUEST");
+    }
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || excluded_remote_path(path)
+        || relative.components().any(|component| {
+            !matches!(component, Component::Normal(_))
+                || component
+                    .as_os_str()
+                    .to_str()
+                    .is_none_or(|part| part.starts_with('.'))
+        })
+    {
+        return Err("INVALID_REQUEST");
+    }
+    let worktree = exposed_worktree(request, state, cx)?;
+    let allowed = worktree.read(cx).entries(false, 0).any(|entry| {
+        entry.path.as_unix_str() == path
+            && !entry.is_dir()
+            && !entry.is_hidden
+            && !entry.is_private
+            && !entry.is_external
+            && !entry.is_fifo
+            && !entry.is_ignored
+    });
+    if !allowed {
+        return Err("FILE_UNAVAILABLE");
+    }
+    let candidate =
+        fs::canonicalize(state.project_root.join(relative)).map_err(|_| "FILE_UNAVAILABLE")?;
+    if !candidate.starts_with(&state.project_root) || !candidate.is_file() {
+        return Err("FILE_UNAVAILABLE");
+    }
+    Ok(candidate)
+}
+
+fn project_files(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let worktree = match exposed_worktree(request, state, cx) {
+        Ok(worktree) => worktree,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let mut truncated = false;
+    let entries = worktree
+        .read(cx)
+        .entries(false, 0)
+        .filter(|entry| {
+            !entry.path.is_empty()
+                && !entry.is_hidden
+                && !entry.is_private
+                && !entry.is_external
+                && !entry.is_fifo
+                && !entry.is_ignored
+                && !excluded_remote_path(entry.path.as_unix_str())
+        })
+        .take(MAX_PROJECT_FILES + 1)
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            if index == MAX_PROJECT_FILES {
+                truncated = true;
+                return None;
+            }
+            Some(json!({
+                "path": entry.path.as_unix_str(),
+                "kind": if entry.is_dir() { "directory" } else { "file" },
+                "size": entry.size,
+            }))
+        })
+        .collect::<Vec<_>>();
+    success(
+        &request.request_id,
+        json!({"entries": entries, "truncated": truncated, "provisional": false}),
+    )
+}
+
+fn read_project_text(path: &Path) -> std::result::Result<(String, bool), &'static str> {
+    let file = fs::File::open(path).map_err(|_| "FILE_UNAVAILABLE")?;
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "FILE_UNAVAILABLE")?;
+    let truncated = bytes.len() > MAX_FILE_BYTES;
+    if truncated {
+        bytes.truncate(MAX_FILE_BYTES);
+        while std::str::from_utf8(&bytes).is_err() && !bytes.is_empty() {
+            bytes.pop();
+        }
+    }
+    if bytes.contains(&0) {
+        return Err("UNSUPPORTED_FILE");
+    }
+    let content = String::from_utf8(bytes).map_err(|_| "UNSUPPORTED_FILE")?;
+    Ok((content, truncated))
+}
+
+fn project_file(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let Some(path) = request.params.get("path").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let absolute = match safe_project_entry(path, request, state, cx) {
+        Ok(path) => path,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let (content, truncated) = match read_project_text(&absolute) {
+        Ok(content) => content,
+        Err(code) => return error(&request.request_id, code),
+    };
+    success(
+        &request.request_id,
+        json!({"path": path, "content": content, "truncated": truncated, "provisional": false}),
+    )
+}
+
+fn change_kind(status: FileStatus) -> &'static str {
+    if status.is_conflicted() {
+        "conflict"
+    } else if status.is_deleted() {
+        "deleted"
+    } else if status.is_created() {
+        "added"
+    } else if status.is_modified() {
+        "modified"
+    } else if status.is_untracked() {
+        "untracked"
+    } else {
+        "changed"
+    }
+}
+
+fn stage_kind(status: StageStatus) -> &'static str {
+    match status {
+        StageStatus::Staged => "staged",
+        StageStatus::Unstaged => "unstaged",
+        StageStatus::PartiallyStaged => "partial",
+    }
+}
+
+fn changes_snapshot(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let thread = match exposed_thread_for_request(request, state, cx) {
+        Ok(thread) => thread,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let project = thread.read(cx).project().clone();
+    let Some(repository) = project.read(cx).active_repository(cx) else {
+        return success(
+            &request.request_id,
+            json!({"repository": null, "entries": [], "provisional": false}),
+        );
+    };
+    let repository = repository.read(cx);
+    let head = repository
+        .head_commit
+        .as_ref()
+        .map(|commit| commit.sha.to_string());
+    let revision = format!(
+        "{}:{}",
+        head.as_deref().unwrap_or("unborn"),
+        repository.scan_id
+    );
+    let entries = repository
+        .cached_status()
+        .filter(|entry| !entry.status.is_ignored())
+        .filter(|entry| {
+            repository
+                .repo_path_to_abs_path(&entry.repo_path)
+                .starts_with(&state.project_root)
+        })
+        .map(|entry| {
+            json!({
+                "path": entry.repo_path.as_unix_str(),
+                "status": change_kind(entry.status),
+                "staging": stage_kind(entry.status.staging()),
+                "added": entry.diff_stat.map(|stat| stat.added),
+                "deleted": entry.diff_stat.map(|stat| stat.deleted),
+            })
+        })
+        .collect::<Vec<_>>();
+    success(
+        &request.request_id,
+        json!({
+            "repository": {
+                "branch": repository.branch.as_ref().map(|branch| branch.name()),
+                "head": head,
+                "revision": revision,
+            },
+            "entries": entries,
+            "provisional": false,
+        }),
+    )
+}
+
+fn changes_diff(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let thread = match exposed_thread_for_request(request, state, cx) {
+        Ok(thread) => thread,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let Some(expected_revision) = request.params.get("revision").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let project = thread.read(cx).project().clone();
+    let Some(repository) = project.read(cx).active_repository(cx) else {
+        return error(&request.request_id, "REPOSITORY_UNAVAILABLE");
+    };
+    let actual_revision = {
+        let repository = repository.read(cx);
+        format!(
+            "{}:{}",
+            repository
+                .head_commit
+                .as_ref()
+                .map(|commit| commit.sha.as_ref())
+                .unwrap_or("unborn"),
+            repository.scan_id
+        )
+    };
+    if expected_revision != actual_revision {
+        return error(&request.request_id, "STALE_REVISION");
+    }
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if let Some(record) = state.diffs.borrow().get(thread_id) {
+        match record {
+            DiffRecord::Loading { revision } if revision == expected_revision => {
+                return success(
+                    &request.request_id,
+                    json!({"outcome": "loading", "revision": revision}),
+                );
+            }
+            DiffRecord::Ready {
+                revision,
+                diff,
+                truncated,
+            } if revision == expected_revision => {
+                return success(
+                    &request.request_id,
+                    json!({"outcome": "ready", "revision": revision, "diff": diff, "truncated": truncated}),
+                );
+            }
+            DiffRecord::Failed { revision } if revision == expected_revision => {
+                return error(&request.request_id, "DIFF_UNAVAILABLE");
+            }
+            _ => {}
+        }
+    }
+
+    let receiver = repository.update(cx, |repository, cx| {
+        repository.diff(DiffType::HeadToWorktree, cx)
+    });
+    state.diffs.borrow_mut().insert(
+        thread_id.to_string(),
+        DiffRecord::Loading {
+            revision: actual_revision.clone(),
+        },
+    );
+    let probe_state = cx.global::<ProbeGlobal>().0.clone();
+    let thread_id = thread_id.to_string();
+    let revision = actual_revision.clone();
+    cx.spawn(async move |_cx| {
+        let record = match receiver.await {
+            Ok(Ok(mut diff)) => {
+                let truncated = diff.len() > MAX_DIFF_BYTES;
+                if truncated {
+                    let mut end = MAX_DIFF_BYTES;
+                    while !diff.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    diff.truncate(end);
+                }
+                DiffRecord::Ready {
+                    revision,
+                    diff,
+                    truncated,
+                }
+            }
+            _ => DiffRecord::Failed { revision },
+        };
+        probe_state.diffs.borrow_mut().insert(thread_id, record);
+    })
+    .detach();
+    success(
+        &request.request_id,
+        json!({"outcome": "loading", "revision": actual_revision}),
+    )
+}
+
+fn change_operation_result(request_id: &str, state: &ChangeOperationState) -> Value {
+    match state {
+        ChangeOperationState::Running => success(
+            request_id,
+            json!({"outcome": "running", "provisional": true}),
+        ),
+        ChangeOperationState::Succeeded => success(
+            request_id,
+            json!({"outcome": "succeeded", "provisional": false}),
+        ),
+        ChangeOperationState::Failed => error(request_id, "OPERATION_FAILED"),
+    }
+}
+
+fn change_stage(request: &ProbeRequest, state: &ProbeState, stage: bool, cx: &mut App) -> Value {
+    let thread = match exposed_thread_for_request(request, state, cx) {
+        Ok(thread) => thread,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let digest = match payload_digest(&request.params) {
+        Ok(digest) => digest,
+        Err(code) => return error(&request.request_id, code),
+    };
+    if let Some(operation) = state.change_operations.borrow().get(&request.request_id) {
+        if operation.payload_digest != digest {
+            return error(&request.request_id, "REQUEST_CONFLICT");
+        }
+        return change_operation_result(&request.request_id, &operation.state);
+    }
+    if state.change_operations.borrow().len() >= 128 {
+        return error(&request.request_id, "RATE_LIMITED");
+    }
+    let Some(expected_revision) = request.params.get("revision").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(path_values) = request.params.get("paths").and_then(Value::as_array) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if path_values.is_empty() || path_values.len() > 100 {
+        return error(&request.request_id, "INVALID_REQUEST");
+    }
+    let project = thread.read(cx).project().clone();
+    let Some(repository) = project.read(cx).active_repository(cx) else {
+        return error(&request.request_id, "REPOSITORY_UNAVAILABLE");
+    };
+    let (actual_revision, paths) = {
+        let repository = repository.read(cx);
+        let actual_revision = format!(
+            "{}:{}",
+            repository
+                .head_commit
+                .as_ref()
+                .map(|commit| commit.sha.as_ref())
+                .unwrap_or("unborn"),
+            repository.scan_id
+        );
+        if expected_revision != actual_revision {
+            return error(&request.request_id, "STALE_REVISION");
+        }
+        let mut paths = Vec::with_capacity(path_values.len());
+        for value in path_values {
+            let Some(path) = value.as_str() else {
+                return error(&request.request_id, "INVALID_REQUEST");
+            };
+            let Some(entry) = repository
+                .cached_status()
+                .find(|entry| entry.repo_path.as_unix_str() == path)
+            else {
+                return error(&request.request_id, "STALE_REVISION");
+            };
+            if !repository
+                .repo_path_to_abs_path(&entry.repo_path)
+                .starts_with(&state.project_root)
+                || (stage && entry.status.staging() == StageStatus::Staged)
+                || (!stage && entry.status.staging() == StageStatus::Unstaged)
+            {
+                return error(&request.request_id, "INVALID_REQUEST");
+            }
+            let relative = match RelPath::from_unix_str(path) {
+                Ok(relative) => relative,
+                Err(_) => return error(&request.request_id, "INVALID_REQUEST"),
+            };
+            paths.push(RepoPath::from_rel_path(relative));
+        }
+        (actual_revision, paths)
+    };
+    let task = repository.update(cx, |repository, cx| {
+        if stage {
+            repository.stage_entries(paths, cx)
+        } else {
+            repository.unstage_entries(paths, cx)
+        }
+    });
+    state.change_operations.borrow_mut().insert(
+        request.request_id.clone(),
+        ChangeOperationRecord {
+            payload_digest: digest,
+            state: ChangeOperationState::Running,
+        },
+    );
+    let probe_state = cx.global::<ProbeGlobal>().0.clone();
+    let request_id = request.request_id.clone();
+    cx.spawn(async move |_cx| {
+        let next_state = if task.await.is_ok() {
+            ChangeOperationState::Succeeded
+        } else {
+            ChangeOperationState::Failed
+        };
+        if let Some(operation) = probe_state
+            .change_operations
+            .borrow_mut()
+            .get_mut(&request_id)
+        {
+            operation.state = next_state;
+        }
+    })
+    .detach();
+    success(
+        &request.request_id,
+        json!({"outcome": "running", "revision": actual_revision, "provisional": true}),
+    )
+}
+
+fn payload_digest(params: &Value) -> std::result::Result<String, &'static str> {
+    let encoded = serde_json::to_vec(params).map_err(|_| "INVALID_REQUEST")?;
+    let digest = Sha256::digest(encoded);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn attachment_content(
+    request: &ProbeRequest,
+    state: &ProbeState,
+    cx: &App,
+) -> std::result::Result<Vec<acp::ContentBlock>, &'static str> {
+    let mut content = Vec::new();
+    let context_paths = match request.params.get("context_paths") {
+        None => &[][..],
+        Some(Value::Array(paths)) if paths.len() <= MAX_ATTACHMENTS => paths.as_slice(),
+        _ => return Err("INVALID_REQUEST"),
+    };
+    for value in context_paths {
+        let path = value.as_str().ok_or("INVALID_REQUEST")?;
+        let absolute = safe_project_entry(path, request, state, cx)?;
+        let (text, truncated) = read_project_text(&absolute)?;
+        if truncated {
+            return Err("FILE_TOO_LARGE");
+        }
+        let uri = url::Url::from_file_path(&absolute)
+            .map_err(|_| "FILE_UNAVAILABLE")?
+            .to_string();
+        content.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                text, uri,
+            )),
+        )));
+    }
+
+    let uploads = match request.params.get("uploads") {
+        None => &[][..],
+        Some(Value::Array(uploads))
+            if uploads.len() <= MAX_ATTACHMENTS
+                && uploads.len().saturating_add(context_paths.len()) <= MAX_ATTACHMENTS =>
+        {
+            uploads.as_slice()
+        }
+        _ => return Err("INVALID_REQUEST"),
+    };
+    for upload in uploads {
+        let Some(upload) = upload.as_object() else {
+            return Err("INVALID_REQUEST");
+        };
+        if upload
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "mime_type" | "data"))
+        {
+            return Err("INVALID_REQUEST");
+        }
+        let Some(name) = upload.get("name").and_then(Value::as_str) else {
+            return Err("INVALID_REQUEST");
+        };
+        let Some(mime_type) = upload.get("mime_type").and_then(Value::as_str) else {
+            return Err("INVALID_REQUEST");
+        };
+        let Some(data) = upload.get("data").and_then(Value::as_str) else {
+            return Err("INVALID_REQUEST");
+        };
+        if name.is_empty()
+            || name.len() > 128
+            || Path::new(name).file_name().and_then(|part| part.to_str()) != Some(name)
+            || name.starts_with('.')
+            || mime_type.len() > 128
+        {
+            return Err("INVALID_REQUEST");
+        }
+        let decoded = STANDARD.decode(data).map_err(|_| "INVALID_REQUEST")?;
+        if decoded.len() > MAX_UPLOAD_BYTES {
+            return Err("PAYLOAD_TOO_LARGE");
+        }
+        if matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+            content.push(acp::ContentBlock::Image(
+                acp::ImageContent::new(data, mime_type)
+                    .uri(Some(format!("zedlink-upload:///{name}"))),
+            ));
+        } else if mime_type.starts_with("text/")
+            || matches!(mime_type, "application/json" | "application/xml")
+        {
+            if decoded.len() > MAX_FILE_BYTES || decoded.contains(&0) {
+                return Err("FILE_TOO_LARGE");
+            }
+            let text = String::from_utf8(decoded).map_err(|_| "UNSUPPORTED_FILE")?;
+            content.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new(text, format!("zedlink-upload:///{name}")),
+                ),
+            )));
+        } else {
+            return Err("UNSUPPORTED_FILE");
+        }
+    }
+    Ok(content)
+}
+
 fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
     let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
@@ -1005,10 +1630,14 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
+    let payload_digest = match payload_digest(&request.params) {
+        Ok(digest) => digest,
+        Err(code) => return error(&request.request_id, code),
+    };
 
     let submissions = state.submissions.borrow();
     if let Some(previous) = submissions.get(&request.request_id) {
-        if previous.thread_id != thread_id || previous.text != text {
+        if previous.thread_id != thread_id || previous.payload_digest != payload_digest {
             return error(&request.request_id, "REQUEST_CONFLICT");
         }
         return send_result(&request.request_id, previous.outcome);
@@ -1042,11 +1671,21 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     } else {
         false
     };
+    if native_command
+        && (request.params.get("context_paths").is_some()
+            || request.params.get("uploads").is_some())
+    {
+        return error(&request.request_id, "INVALID_REQUEST");
+    }
     if view.read(cx).is_loading_message_contents() {
         return error(&request.request_id, "INSTANCE_UNAVAILABLE");
     }
 
-    let content = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+    let mut content = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+    match attachment_content(request, state, cx) {
+        Ok(attachments) => content.extend(attachments),
+        Err(code) => return error(&request.request_id, code),
+    }
     let can_send_now =
         thread.read(cx).status() == ThreadStatus::Idle && !view.read(cx).has_queued_messages();
     let sent = cx.with_window(view.entity_id(), |window, cx| {
@@ -1102,7 +1741,7 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
         request.request_id.clone(),
         SubmissionRecord {
             thread_id: thread_id.to_string(),
-            text: text.to_string(),
+            payload_digest,
             outcome,
         },
     );
