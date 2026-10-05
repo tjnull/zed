@@ -1878,6 +1878,125 @@ impl ThreadView {
         cx.notify();
     }
 
+    pub(crate) fn zedlink_error_summary(&self) -> Option<(&'static str, String, String, bool)> {
+        self.thread_error.as_ref().map(|error| match error {
+            ThreadError::ZedPaymentRequired => (
+                "payment_required",
+                "Usage limit reached".into(),
+                "Zed reached its configured usage limit.".into(),
+                false,
+            ),
+            ThreadError::DataRetentionConsentRequired => (
+                "data_retention_consent_required",
+                "Model unavailable".into(),
+                "The selected model is unavailable with the current data retention setting."
+                    .into(),
+                false,
+            ),
+            ThreadError::Refusal => (
+                "refusal",
+                "Request refused".into(),
+                "The selected model refused this request.".into(),
+                false,
+            ),
+            ThreadError::AuthenticationRequired(message) => (
+                "authentication_required",
+                "Authentication required".into(),
+                message.to_string(),
+                false,
+            ),
+            ThreadError::RateLimitExceeded { provider } => (
+                "rate_limit_exceeded",
+                "Rate limit reached".into(),
+                format!("{provider}'s rate limit was reached. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::ServerOverloaded { provider } => (
+                "server_overloaded",
+                "Provider unavailable".into(),
+                format!("{provider}'s servers are temporarily unavailable. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::PromptTooLarge => (
+                "prompt_too_large",
+                "Context too large".into(),
+                "The request exceeded the model's context window.".into(),
+                false,
+            ),
+            ThreadError::NoCredentials { provider } => (
+                "no_credentials",
+                "Credentials missing".into(),
+                format!("No credentials are configured for {provider}."),
+                false,
+            ),
+            ThreadError::StreamError { provider } => (
+                "stream_error",
+                "Model connection interrupted".into(),
+                format!("The connection to {provider}'s API was interrupted. Zed will retry automatically."),
+                true,
+            ),
+            ThreadError::AuthenticationFailed { provider } => (
+                "authentication_failed",
+                "Authentication failed".into(),
+                format!("Zed could not authenticate with {provider}."),
+                false,
+            ),
+            ThreadError::PermissionDenied { provider, message } => (
+                "permission_denied",
+                "Permission denied".into(),
+                message
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{provider} rejected the request.")),
+                false,
+            ),
+            ThreadError::ProviderRejection { message } => (
+                "provider_rejection",
+                "Model request failed".into(),
+                message.to_string(),
+                true,
+            ),
+            ThreadError::MaxOutputTokens => (
+                "max_output_tokens",
+                "Output limit reached".into(),
+                "The model reached its maximum output length.".into(),
+                false,
+            ),
+            ThreadError::NoModelSelected => (
+                "no_model_selected",
+                "No model selected".into(),
+                "Select a model in desktop Zed before sending another message.".into(),
+                false,
+            ),
+            ThreadError::ApiError { provider } => (
+                "api_error",
+                "Model API error".into(),
+                format!("{provider}'s API returned an unexpected error."),
+                true,
+            ),
+            ThreadError::Other { message, .. } => (
+                "other",
+                "Agent request failed".into(),
+                message.to_string(),
+                true,
+            ),
+        })
+    }
+
+    pub(crate) fn zedlink_retry_status(&self) -> Option<(String, usize, usize, u64)> {
+        self.thread_retry_status.as_ref().map(|status| {
+            let remaining = status
+                .duration
+                .saturating_sub(Instant::now().saturating_duration_since(status.started_at));
+            (
+                status.last_error.to_string(),
+                status.attempt,
+                status.max_attempts,
+                remaining.as_millis().try_into().unwrap_or(u64::MAX),
+            )
+        })
+    }
+
     fn emit_thread_error_telemetry(&self, error: &ThreadError, cx: &mut Context<Self>) {
         let (error_kind, acp_error_code, message): (&str, Option<SharedString>, SharedString) =
             match error {

@@ -327,18 +327,27 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         }
         "thread.list" => {
             let mut seen = HashSet::new();
-            let threads = loaded_threads(&state.project_root, cx)
+            let threads = loaded_thread_views(&state.project_root, cx)
                 .into_iter()
-                .filter_map(|thread| {
+                .filter_map(|(thread, view)| {
                     let thread = thread.read(cx);
                     let id = thread.session_id().to_string();
                     (state.exposed_threads.borrow().contains(&id) && seen.insert(id.clone())).then(
                         || {
+                            let agent_error = zedlink_error_value(
+                                thread.had_error(),
+                                view.read(cx).zedlink_error_summary(),
+                            );
+                            let retry_status =
+                                zedlink_retry_value(view.read(cx).zedlink_retry_status());
                             json!({
                                 "thread_id": id,
-                            "title": thread.title().map(|title| title.to_string()),
-                            "status": format!("{:?}", thread.status()),
-                            "current_turn_id": thread.current_turn_id(),
+                                "title": thread.title().map(|title| title.to_string()),
+                                "status": format!("{:?}", thread.status()),
+                                "current_turn_id": thread.current_turn_id(),
+                                "had_error": thread.had_error(),
+                                "agent_error": agent_error,
+                                "retry_status": retry_status,
                             })
                         },
                     )
@@ -361,13 +370,16 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             if !state.exposed_threads.borrow().contains(id) {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             }
-            let Some(thread) = loaded_threads(&state.project_root, cx)
+            let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
                 .into_iter()
-                .find(|thread| thread.read(cx).session_id().to_string() == id)
+                .find(|(thread, _)| thread.read(cx).session_id().to_string() == id)
             else {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             };
             let thread = thread.read(cx);
+            let agent_error =
+                zedlink_error_value(thread.had_error(), view.read(cx).zedlink_error_summary());
+            let retry_status = zedlink_retry_value(view.read(cx).zedlink_retry_status());
             let mut used = 0;
             let mut entries = Vec::new();
             let mut truncated = false;
@@ -412,6 +424,9 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "title": thread.title().map(|title| title.to_string()),
                     "status": format!("{:?}", thread.status()),
                     "current_turn_id": thread.current_turn_id(),
+                    "had_error": thread.had_error(),
+                    "agent_error": agent_error,
+                    "retry_status": retry_status,
                     "pending_approvals": pending_approvals(thread, cx),
                     "entries_markdown": entries,
                     "truncated": truncated,
@@ -1096,6 +1111,39 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
 
 fn send_result(request_id: &str, outcome: &str) -> Value {
     success(request_id, json!({"outcome": outcome, "provisional": true}))
+}
+
+fn zedlink_error_value(
+    had_error: bool,
+    error: Option<(&'static str, String, String, bool)>,
+) -> Value {
+    match error {
+        Some((kind, title, message, retrying)) => json!({
+            "kind": kind,
+            "title": title,
+            "message": message.chars().take(2048).collect::<String>(),
+            "retrying": retrying,
+        }),
+        None if had_error => json!({
+            "kind": "agent_error",
+            "title": "Agent request failed",
+            "message": "The last native Zed Agent turn failed. Open desktop Zed for any additional detail.",
+            "retrying": false,
+        }),
+        None => Value::Null,
+    }
+}
+
+fn zedlink_retry_value(retry: Option<(String, usize, usize, u64)>) -> Value {
+    match retry {
+        Some((last_error, attempt, max_attempts, next_attempt_in_ms)) => json!({
+            "last_error": last_error.chars().take(1024).collect::<String>(),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "next_attempt_in_ms": next_attempt_in_ms,
+        }),
+        None => Value::Null,
+    }
 }
 
 fn loaded_threads(project_root: &Path, cx: &App) -> Vec<Entity<AcpThread>> {
