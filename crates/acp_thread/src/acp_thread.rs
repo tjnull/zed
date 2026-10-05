@@ -2680,6 +2680,10 @@ impl AcpThread {
         }
     }
 
+    pub fn current_turn_id(&self) -> Option<u32> {
+        self.running_turn.as_ref().map(|turn| turn.id)
+    }
+
     pub fn had_error(&self) -> bool {
         self.had_error
     }
