@@ -36,6 +36,8 @@ pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+#[cfg(unix)]
+mod zedlink_probe;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -614,6 +616,10 @@ pub fn init(
         init_language_model_settings(cx);
     }
     agent_panel::init(cx);
+    #[cfg(unix)]
+    if !is_eval {
+        zedlink_probe::init(cx);
+    }
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);

@@ -1163,6 +1163,19 @@ impl ThreadView {
             PromptLocalCommand::ThumbsDown => {
                 self.handle_feedback_click(ThreadFeedback::Negative, window, cx);
             }
+            #[cfg(unix)]
+            PromptLocalCommand::RemoteControl => {
+                if self.parent_session_id.is_some() || self.as_native_thread(cx).is_none() {
+                    return;
+                }
+                match crate::zedlink_probe::toggle_thread_exposure(&self.thread, cx) {
+                    Some(true) => {
+                        self.show_local_command_toast("Thread exposed to ZedLink locally", cx)
+                    }
+                    Some(false) => self.show_local_command_toast("ZedLink exposure stopped", cx),
+                    None => self.show_local_command_toast("ZedLink local probe unavailable", cx),
+                }
+            }
         }
     }
 
@@ -1550,6 +1563,10 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    pub(crate) fn is_loading_message_contents(&self) -> bool {
+        self.is_loading_contents
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after
@@ -6982,6 +6999,14 @@ impl ThreadView {
         if self.is_thread_feedback_enabled(cx) {
             commands.push(PromptLocalCommand::ThumbsUp);
             commands.push(PromptLocalCommand::ThumbsDown);
+        }
+
+        #[cfg(unix)]
+        if self.parent_session_id.is_none()
+            && self.as_native_thread(cx).is_some()
+            && crate::zedlink_probe::is_available(cx)
+        {
+            commands.push(PromptLocalCommand::RemoteControl);
         }
 
         commands

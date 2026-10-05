@@ -199,6 +199,8 @@ impl PromptContextAction {
 pub enum PromptLocalCommand {
     ThumbsUp,
     ThumbsDown,
+    #[cfg(unix)]
+    RemoteControl,
 }
 
 impl PromptLocalCommand {
@@ -206,6 +208,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
+            #[cfg(unix)]
+            Self::RemoteControl => "remote-control",
         }
     }
 
@@ -213,6 +217,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
+            #[cfg(unix)]
+            Self::RemoteControl => "Remote Control",
         }
     }
 
@@ -224,6 +230,8 @@ impl PromptLocalCommand {
             Self::ThumbsDown => {
                 "Rate this response as not helpful. Sends the current conversation to the Zed team."
             }
+            #[cfg(unix)]
+            Self::RemoteControl => "Expose or stop exposing this native Agent thread to ZedLink.",
         }
     }
 
@@ -231,6 +239,8 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
+            #[cfg(unix)]
+            Self::RemoteControl => IconName::Link,
         }
     }
 }
