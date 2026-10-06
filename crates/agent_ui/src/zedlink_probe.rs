@@ -25,7 +25,7 @@ use git::{
     repository::{DiffType, RepoPath},
     status::{FileStatus, StageStatus},
 };
-use gpui::{App, Entity, Global, Subscription, Task};
+use gpui::{App, AppContext, Entity, Global, Subscription, Task};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,9 @@ const MAX_APPROVAL_INPUT_BYTES: usize = 8192;
 const MAX_THREAD_TITLE_BYTES: usize = 128;
 const MAX_PROJECT_FILES: usize = 1000;
 const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_SEARCH_FILES: usize = 500;
+const MAX_SEARCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 8;
 const MAX_DIFF_BYTES: usize = 512 * 1024;
@@ -70,6 +73,7 @@ struct ProbeState {
     subscriptions: RefCell<HashMap<String, Subscription>>,
     events: RefCell<HashMap<String, ThreadEvents>>,
     diffs: RefCell<HashMap<String, DiffRecord>>,
+    searches: RefCell<HashMap<String, SearchRecord>>,
     change_operations: RefCell<HashMap<String, ChangeOperationRecord>>,
 }
 
@@ -105,6 +109,14 @@ enum DiffRecord {
     },
     Failed {
         revision: String,
+    },
+}
+
+enum SearchRecord {
+    Loading,
+    Ready {
+        matches: Vec<Value>,
+        truncated: bool,
     },
 }
 
@@ -174,6 +186,7 @@ pub fn init(cx: &mut App) {
                 subscriptions: RefCell::new(HashMap::new()),
                 events: RefCell::new(HashMap::new()),
                 diffs: RefCell::new(HashMap::new()),
+                searches: RefCell::new(HashMap::new()),
                 change_operations: RefCell::new(HashMap::new()),
             },
         ))
@@ -332,7 +345,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             json!({
                 "instance_id": state.instance_id,
                 "epoch": state.epoch,
-                "capabilities": ["thread.list", "thread.create", "thread.snapshot", "thread.events", "thread.commands", "thread.settings", "thread.settings.update", "thread.send", "thread.attachments", "thread.cancel", "thread.approvals", "approval.respond", "project.files", "project.file", "changes.snapshot", "changes.diff", "changes.stage", "changes.unstage", "request.status"],
+                "capabilities": ["thread.list", "thread.create", "thread.snapshot", "thread.events", "thread.commands", "thread.settings", "thread.settings.update", "thread.send", "thread.attachments", "thread.cancel", "thread.approvals", "approval.respond", "project.files", "project.file", "project.search", "changes.snapshot", "changes.diff", "changes.stage", "changes.unstage", "request.status"],
                 "provisional": true,
             }),
         ),
@@ -531,6 +544,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         "thread.settings.update" => update_thread_settings(&request, state, cx),
         "project.files" => project_files(&request, state, cx),
         "project.file" => project_file(&request, state, cx),
+        "project.search" => project_search(&request, state, cx),
         "changes.snapshot" => changes_snapshot(&request, state, cx),
         "changes.diff" => changes_diff(&request, state, cx),
         "changes.stage" => change_stage(&request, state, true, cx),
@@ -1214,6 +1228,171 @@ fn project_file(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
     success(
         &request.request_id,
         json!({"path": path, "content": content, "truncated": truncated, "provisional": false}),
+    )
+}
+
+fn search_project_paths(
+    project_root: PathBuf,
+    paths: Vec<String>,
+    query: String,
+    case_sensitive: bool,
+    candidate_truncated: bool,
+) -> SearchRecord {
+    let needle = if case_sensitive {
+        query
+    } else {
+        query.to_ascii_lowercase()
+    };
+    let mut matches = Vec::new();
+    let mut scanned_bytes = 0;
+    let mut truncated = candidate_truncated;
+    for path in paths.into_iter().take(MAX_SEARCH_FILES) {
+        if scanned_bytes >= MAX_SEARCH_BYTES || matches.len() >= MAX_SEARCH_MATCHES {
+            truncated = true;
+            break;
+        }
+        let Ok(absolute) = fs::canonicalize(project_root.join(&path)) else {
+            continue;
+        };
+        if !absolute.starts_with(&project_root) || !absolute.is_file() {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&absolute) else {
+            continue;
+        };
+        let remaining = MAX_SEARCH_BYTES.saturating_sub(scanned_bytes);
+        let limit = remaining.min(MAX_FILE_BYTES);
+        let mut bytes = Vec::new();
+        if file
+            .take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        if bytes.len() > limit {
+            bytes.truncate(limit);
+            truncated = true;
+        }
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len());
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for (line_index, line) in content.lines().enumerate() {
+            let haystack = if case_sensitive {
+                line.to_string()
+            } else {
+                line.to_ascii_lowercase()
+            };
+            let Some(column) = haystack.find(&needle) else {
+                continue;
+            };
+            matches.push(json!({
+                "path": path,
+                "line": line_index + 1,
+                "column": line[..column].chars().count() + 1,
+                "preview": line.chars().take(300).collect::<String>(),
+            }));
+            if matches.len() == MAX_SEARCH_MATCHES {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    SearchRecord::Ready { matches, truncated }
+}
+
+fn project_search(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let Some(query) = request.params.get("query").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if query.trim().len() < 2
+        || query.len() > 256
+        || query
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return error(&request.request_id, "INVALID_REQUEST");
+    }
+    let case_sensitive = request
+        .params
+        .get("case_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let worktree = match exposed_worktree(request, state, cx) {
+        Ok(worktree) => worktree,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let key = format!("{thread_id}:{case_sensitive}:{query}");
+    let existing_search = state.searches.borrow_mut().remove(&key);
+    if let Some(record) = existing_search {
+        return match record {
+            SearchRecord::Loading => {
+                state
+                    .searches
+                    .borrow_mut()
+                    .insert(key, SearchRecord::Loading);
+                success(
+                    &request.request_id,
+                    json!({"outcome": "loading", "provisional": true}),
+                )
+            }
+            SearchRecord::Ready { matches, truncated } => success(
+                &request.request_id,
+                json!({"outcome": "ready", "matches": matches, "truncated": truncated, "provisional": false}),
+            ),
+        };
+    }
+    if state.searches.borrow().len() >= 32 {
+        return error(&request.request_id, "RATE_LIMITED");
+    }
+    let mut paths = worktree
+        .read(cx)
+        .entries(false, 0)
+        .filter(|entry| {
+            !entry.is_dir()
+                && !entry.is_hidden
+                && !entry.is_private
+                && !entry.is_external
+                && !entry.is_fifo
+                && !entry.is_ignored
+                && !excluded_remote_path(entry.path.as_unix_str())
+        })
+        .take(MAX_SEARCH_FILES + 1)
+        .map(|entry| entry.path.as_unix_str().to_string())
+        .collect::<Vec<_>>();
+    let candidate_truncated = paths.len() > MAX_SEARCH_FILES;
+    paths.truncate(MAX_SEARCH_FILES);
+    state
+        .searches
+        .borrow_mut()
+        .insert(key.clone(), SearchRecord::Loading);
+    let project_root = state.project_root.clone();
+    let query = query.to_string();
+    let task = cx.background_spawn(async move {
+        search_project_paths(
+            project_root,
+            paths,
+            query,
+            case_sensitive,
+            candidate_truncated,
+        )
+    });
+    let probe_state = cx.global::<ProbeGlobal>().0.clone();
+    cx.spawn(async move |_cx| {
+        let record = task.await;
+        probe_state.searches.borrow_mut().insert(key, record);
+    })
+    .detach();
+    success(
+        &request.request_id,
+        json!({"outcome": "loading", "provisional": true}),
     )
 }
 
