@@ -1974,12 +1974,24 @@ impl ThreadView {
                 format!("{provider}'s API returned an unexpected error."),
                 true,
             ),
-            ThreadError::Other { message, .. } => (
-                "other",
-                "Agent request failed".into(),
-                message.to_string(),
-                true,
-            ),
+            ThreadError::Other { message, .. } => {
+                let normalized = message.to_lowercase();
+                if normalized.contains("image input") && normalized.contains("vision") {
+                    (
+                        "unsupported_image_input",
+                        "Image input unavailable".into(),
+                        message.to_string(),
+                        false,
+                    )
+                } else {
+                    (
+                        "other",
+                        "Agent request failed".into(),
+                        message.to_string(),
+                        false,
+                    )
+                }
+            }
         })
     }
 
