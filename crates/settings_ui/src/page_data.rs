@@ -1,4 +1,4 @@
-use gpui::{Action as _, App, PromptLevel, ReadGlobal};
+use gpui::{Action as _, App, PromptButton, PromptLevel, ReadGlobal};
 use itertools::Itertools as _;
 use settings::{
     AudioInputDeviceName, AudioOutputDeviceName, EditPredictionDataCollectionChoice,
@@ -95,15 +95,22 @@ fn run_zedlink_manager_action(action: &'static str, window: &mut gpui::Window, c
         .and_then(|settings| settings.manager_path.as_deref())
         .map(str::trim)
         .filter(|path| !path.is_empty());
-    let success_message = if action == "check-connection" {
-        "ZedLink connection passed"
-    } else {
-        "ZedLink connection updated"
+    let success_message = match action {
+        "check-connection" => "ZedLink connection passed",
+        "start-gateway-detached" => "ZedLink gateway start requested",
+        "restart-gateway-detached" => "ZedLink gateway restart requested",
+        "stop-gateway" => "ZedLink gateway stopped",
+        "status" => "ZedLink status",
+        "diagnose" => "ZedLink diagnostics",
+        "pair-primary" => "ZedLink pairing page created",
+        _ => "ZedLink connection updated",
     };
-    let failure_message = if action == "check-connection" {
-        "ZedLink connection check failed"
-    } else {
-        "ZedLink could not update the connection"
+    let failure_message = match action {
+        "check-connection" => "ZedLink connection check failed",
+        "status" => "ZedLink status is unavailable",
+        "diagnose" => "ZedLink diagnostics found a problem",
+        "pair-primary" => "ZedLink could not create a pairing page",
+        _ => "ZedLink action failed",
     };
     let (level, message, detail) = match manager_path {
         Some(manager_path) => match Command::new("python3")
@@ -138,6 +145,154 @@ fn run_zedlink_manager_action(action: &'static str, window: &mut gpui::Window, c
     cx.background_executor()
         .spawn(async move {
             prompt.await.ok();
+        })
+        .detach();
+}
+
+fn manage_zedlink_devices(window: &mut gpui::Window, cx: &mut App) {
+    let manager_path = SettingsStore::global(cx)
+        .merged_settings()
+        .zedlink
+        .as_ref()
+        .and_then(|settings| settings.manager_path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    let Some(manager_path) = manager_path else {
+        run_zedlink_manager_action("devices", window, cx);
+        return;
+    };
+    let output = Command::new("python3")
+        .arg(&manager_path)
+        .arg("devices-json")
+        .output();
+    let devices = match output {
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("devices")
+                        .and_then(|devices| devices.as_array())
+                        .cloned()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|device| {
+                    Some((
+                        device.get("id")?.as_str()?.to_owned(),
+                        device.get("name")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "Paired devices are unavailable",
+                Some(&detail),
+                &["OK"],
+                cx,
+            );
+            cx.background_executor()
+                .spawn(async move {
+                    prompt.await.ok();
+                })
+                .detach();
+            return;
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "ZedLink manager could not start",
+                Some(&detail),
+                &["OK"],
+                cx,
+            );
+            cx.background_executor()
+                .spawn(async move {
+                    prompt.await.ok();
+                })
+                .detach();
+            return;
+        }
+    };
+    if devices.is_empty() {
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "No paired devices",
+            Some(
+                "Choose Pair New Device on this page to authorize a browser or installed web app.",
+            ),
+            &["OK"],
+            cx,
+        );
+        cx.background_executor()
+            .spawn(async move {
+                prompt.await.ok();
+            })
+            .detach();
+        return;
+    }
+
+    let mut answers = devices
+        .iter()
+        .map(|(_, name)| PromptButton::new(format!("Revoke {name}")))
+        .collect::<Vec<_>>();
+    answers.push(PromptButton::cancel("Cancel"));
+    let prompt = window.prompt(
+        PromptLevel::Info,
+        "Paired ZedLink devices",
+        Some("Select a device to revoke its browser credential. This does not delete Zed conversations."),
+        &answers,
+        cx,
+    );
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(index) = prompt.await else {
+                return anyhow::Ok(());
+            };
+            let Some((device_id, device_name)) = devices.get(index).cloned() else {
+                return anyhow::Ok(());
+            };
+            let confirmation = cx.prompt(
+                PromptLevel::Warning,
+                &format!("Revoke {device_name}?"),
+                Some("This browser or installed app must pair again before it can access ZedLink."),
+                &[
+                    PromptButton::ok("Revoke Device"),
+                    PromptButton::cancel("Cancel"),
+                ],
+            );
+            if confirmation.await != Ok(0) {
+                return anyhow::Ok(());
+            }
+            let output = Command::new("python3")
+                .arg(manager_path)
+                .arg("revoke-device")
+                .arg(device_id)
+                .output();
+            let (level, message, detail) = match output {
+                Ok(output) if output.status.success() => (
+                    PromptLevel::Info,
+                    "ZedLink device revoked",
+                    String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                ),
+                Ok(output) => (
+                    PromptLevel::Warning,
+                    "ZedLink could not revoke the device",
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ),
+                Err(error) => (
+                    PromptLevel::Warning,
+                    "ZedLink manager could not start",
+                    error.to_string(),
+                ),
+            };
+            cx.prompt(level, message, Some(&detail), &["OK"]).await.ok();
+            anyhow::Ok(())
         })
         .detach();
 }
@@ -450,6 +605,93 @@ fn zedlink_page() -> SettingsPage {
         ]
     }
 
+    fn runtime_section() -> [SettingsPageItem; 3] {
+        [
+            SettingsPageItem::SectionHeader("Runtime and Devices"),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Gateway Control".into(),
+                r#type: Default::default(),
+                json_path: None,
+                description: Some("Start, restart, stop, inspect, and diagnose the configured ZedLink gateway.".into()),
+                search_aliases: &["diagnose", "gateway", "restart", "start", "status", "stop"],
+                in_json: false,
+                files: USER,
+                render: |this, scroll_handle, window, cx| {
+                    let items = [
+                        SettingsPageItem::SectionHeader("Gateway"),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Gateway Status".into(),
+                            description: Some("Show the configured project, private routes, patched Zed bridge, gateway process, and paired-device count.".into()),
+                            button_text: "Show Status".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("status", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Start Gateway".into(),
+                            description: Some("Start the configured private HTTPS gateway in the background. Use Status to confirm it becomes ready.".into()),
+                            button_text: "Start".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("start-gateway-detached", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Restart Gateway".into(),
+                            description: Some("Reload saved connection profiles while preserving gateway identity and paired devices.".into()),
+                            button_text: "Restart".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("restart-gateway-detached", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Stop Gateway".into(),
+                            description: Some("Close all ZedLink listeners. Saved connections, device pairings, and native conversations remain intact.".into()),
+                            button_text: "Stop".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("stop-gateway", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Run Diagnostics".into(),
+                            description: Some("Check the patched binary, settings, private paths, TLS profiles, native bridge, gateway, and paired-device count.".into()),
+                            button_text: "Diagnose".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("diagnose", window, cx)),
+                            files: USER,
+                        }),
+                    ];
+                    this.render_sub_page_items(items.iter().enumerate(), scroll_handle, window, cx)
+                        .into_any_element()
+                },
+            }),
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Paired Devices".into(),
+                r#type: Default::default(),
+                json_path: None,
+                description: Some("Pair a browser or installed web app, view authorized devices, and revoke a selected credential.".into()),
+                search_aliases: &["browser", "device", "pair", "phone", "revoke"],
+                in_json: false,
+                files: USER,
+                render: |this, scroll_handle, window, cx| {
+                    let items = [
+                        SettingsPageItem::SectionHeader("Device Access"),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "Pair New Device".into(),
+                            description: Some("Create a private, five-minute pairing page with a QR code and manual code for phones, tablets, and desktop browsers.".into()),
+                            button_text: "Pair Device".into(),
+                            on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("pair-primary", window, cx)),
+                            files: USER,
+                        }),
+                        SettingsPageItem::ActionLink(ActionLink {
+                            title: "View or Revoke Paired Devices".into(),
+                            description: Some("List browsers and installed web apps authorized by this gateway, then optionally revoke one device after confirmation.".into()),
+                            button_text: "Manage Devices".into(),
+                            on_click: Arc::new(|_, window, cx| manage_zedlink_devices(window, cx)),
+                            files: USER,
+                        }),
+                    ];
+                    this.render_sub_page_items(items.iter().enumerate(), scroll_handle, window, cx)
+                        .into_any_element()
+                },
+            }),
+        ]
+    }
+
     fn bridge_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("Bridge and Startup"),
@@ -712,7 +954,12 @@ fn zedlink_page() -> SettingsPage {
 
     SettingsPage {
         title: "ZedLink",
-        items: concat_sections![connections_section(), bridge_section(), access_section()],
+        items: concat_sections![
+            connections_section(),
+            runtime_section(),
+            bridge_section(),
+            access_section()
+        ],
     }
 }
 
