@@ -2898,6 +2898,30 @@
   //   - "proxy": "socks5h://localhost:10808"
   //   - "proxy": "http://127.0.0.1:10809"
   "proxy": "",
+  // Configure the private local bridge used by ZedLink. Only Agent threads
+  // explicitly exposed with /remote-control become available remotely.
+  "zedlink": {
+    "enabled": false,
+    "state_directory": "",
+    "project_root": "",
+    "start_gateway_on_launch": true,
+    "manager_path": "",
+    "allow_session_creation": true,
+    "allow_attachments": true,
+    "allow_project_context": true,
+    "allow_git_changes": true,
+    "allow_approval_decisions": true,
+    "allow_agent_settings": true,
+    "connection_id": "",
+    "connection_label": "",
+    "connection_provider": "tailscale",
+    "connection_enabled": true,
+    "connection_bind": "",
+    "connection_url": "",
+    "connection_tls_certificate": "",
+    "connection_tls_private_key": "",
+    "connection_origin_tls_name": "",
+  },
   // Set to configure aliases for the command palette.
   // When typing a query which is a key of this object, the value will be used instead.
   //

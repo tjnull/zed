@@ -8,6 +8,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
     rc::Rc,
     sync::mpsc,
     time::Duration,
@@ -28,16 +29,19 @@ use git::{
 use gpui::{App, AppContext, Entity, Global, Subscription, Task};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use settings::SettingsStore;
 use sha2::{Digest, Sha256};
 use util::rel_path::RelPath;
 
 use crate::agent_panel::{AgentPanel, CreateThreadOptions};
-use crate::conversation_view::ThreadView;
+use crate::conversation_view::{ConversationView, ThreadView};
 use crate::{Agent, AgentThreadSource};
 
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_ACTIVITY_BYTES: usize = 256 * 1024;
+const MAX_SUBAGENT_SNAPSHOT_BYTES: usize = 64 * 1024;
+const MAX_SUBAGENTS_PER_SNAPSHOT: usize = 32;
 const MAX_APPROVAL_INPUT_BYTES: usize = 8192;
 const MAX_THREAD_TITLE_BYTES: usize = 128;
 const MAX_PROJECT_FILES: usize = 1000;
@@ -65,6 +69,7 @@ struct ProbeCommand {
 
 struct ProbeState {
     project_root: PathBuf,
+    permissions: ProbePermissions,
     instance_id: String,
     epoch: String,
     submissions: RefCell<HashMap<String, SubmissionRecord>>,
@@ -75,6 +80,77 @@ struct ProbeState {
     diffs: RefCell<HashMap<String, DiffRecord>>,
     searches: RefCell<HashMap<String, SearchRecord>>,
     change_operations: RefCell<HashMap<String, ChangeOperationRecord>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProbePermissions {
+    session_creation: bool,
+    attachments: bool,
+    project_context: bool,
+    git_changes: bool,
+    approval_decisions: bool,
+    agent_settings: bool,
+}
+
+impl ProbePermissions {
+    fn capabilities(self) -> Vec<&'static str> {
+        let mut capabilities = vec![
+            "thread.list",
+            "thread.snapshot",
+            "thread.events",
+            "thread.commands",
+            "thread.settings",
+            "thread.send",
+            "thread.cancel",
+            "thread.subagents",
+            "subagent.cancel",
+            "thread.approvals",
+            "request.status",
+        ];
+        if self.session_creation {
+            capabilities.push("thread.create");
+        }
+        if self.attachments {
+            capabilities.extend(["thread.attachments", "thread.rewind_image"]);
+        }
+        if self.project_context {
+            capabilities.extend(["project.files", "project.file", "project.search"]);
+        }
+        if self.git_changes {
+            capabilities.extend([
+                "changes.snapshot",
+                "changes.diff",
+                "changes.stage",
+                "changes.unstage",
+            ]);
+        }
+        if self.approval_decisions {
+            capabilities.push("approval.respond");
+        }
+        if self.agent_settings {
+            capabilities.push("thread.settings.update");
+        }
+        capabilities
+    }
+
+    fn allows(self, method: &str, params: &Value) -> bool {
+        match method {
+            "thread.create" => self.session_creation,
+            "thread.rewind_image" => self.attachments,
+            "thread.send"
+                if params.get("context_paths").is_some() || params.get("uploads").is_some() =>
+            {
+                self.attachments
+            }
+            "project.files" | "project.file" | "project.search" => self.project_context,
+            "changes.snapshot" | "changes.diff" | "changes.stage" | "changes.unstage" => {
+                self.git_changes
+            }
+            "approval.respond" => self.approval_decisions,
+            "thread.settings.update" => self.agent_settings,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -132,15 +208,72 @@ enum ChangeOperationState {
 }
 
 pub fn init(cx: &mut App) {
-    let (Some(directory), Some(project_root)) = (
-        std::env::var_os("ZEDLINK_PROBE_DIR"),
-        std::env::var_os("ZEDLINK_PROBE_PROJECT_ROOT"),
-    ) else {
+    let settings = cx
+        .global::<SettingsStore>()
+        .merged_settings()
+        .zedlink
+        .clone();
+    let permissions = ProbePermissions {
+        session_creation: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_session_creation)
+            .unwrap_or(true),
+        attachments: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_attachments)
+            .unwrap_or(true),
+        project_context: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_project_context)
+            .unwrap_or(true),
+        git_changes: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_git_changes)
+            .unwrap_or(true),
+        approval_decisions: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_approval_decisions)
+            .unwrap_or(true),
+        agent_settings: settings
+            .as_ref()
+            .and_then(|settings| settings.allow_agent_settings)
+            .unwrap_or(true),
+    };
+    let gateway_manager = settings.as_ref().and_then(|settings| {
+        if !settings.start_gateway_on_launch.unwrap_or(true) {
+            return None;
+        }
+        settings
+            .manager_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    });
+    let environment_paths = || {
+        Some((
+            PathBuf::from(std::env::var_os("ZEDLINK_PROBE_DIR")?),
+            PathBuf::from(std::env::var_os("ZEDLINK_PROBE_PROJECT_ROOT")?),
+        ))
+    };
+    let settings_paths = || {
+        let settings = settings.as_ref()?;
+        if !settings.enabled.unwrap_or(false) {
+            return None;
+        }
+        let state_directory = settings.state_directory.as_deref()?.trim();
+        let project_root = settings.project_root.as_deref()?.trim();
+        if state_directory.is_empty() || project_root.is_empty() {
+            return None;
+        }
+        Some((
+            PathBuf::from(state_directory).join("probe"),
+            PathBuf::from(project_root),
+        ))
+    };
+    let Some((directory, project_root)) = environment_paths().or_else(settings_paths) else {
         return;
     };
-
-    let directory = PathBuf::from(directory);
-    let project_root = PathBuf::from(project_root);
     if !directory.is_absolute() || !project_root.is_absolute() {
         log::warn!("ZedLink probe requires absolute directory and project paths");
         return;
@@ -178,6 +311,7 @@ pub fn init(cx: &mut App) {
             listener,
             ProbeState {
                 project_root,
+                permissions,
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 epoch: uuid::Uuid::new_v4().to_string(),
                 submissions: RefCell::new(HashMap::new()),
@@ -217,6 +351,22 @@ pub fn init(cx: &mut App) {
         return;
     }
     cx.set_global(ProbeGlobal(state.clone()));
+
+    if let Some(manager_path) = gateway_manager {
+        if !manager_path.is_absolute() || !manager_path.is_file() {
+            log::warn!("ZedLink gateway manager path is unavailable");
+        } else if Command::new("python3")
+            .arg(manager_path)
+            .arg("start-gateway")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_err()
+        {
+            log::warn!("ZedLink gateway could not be started automatically");
+        }
+    }
 
     cx.spawn(async move |cx| {
         while let Ok(command) = receiver.recv().await {
@@ -339,13 +489,16 @@ fn handle_stream(
 }
 
 fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    if !state.permissions.allows(&request.method, &request.params) {
+        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+    }
     match request.method.as_str() {
         "instance.info" => success(
             &request.request_id,
             json!({
                 "instance_id": state.instance_id,
                 "epoch": state.epoch,
-                "capabilities": ["thread.list", "thread.create", "thread.snapshot", "thread.events", "thread.commands", "thread.settings", "thread.settings.update", "thread.send", "thread.attachments", "thread.cancel", "thread.approvals", "approval.respond", "project.files", "project.file", "project.search", "changes.snapshot", "changes.diff", "changes.stage", "changes.unstage", "request.status"],
+                "capabilities": state.permissions.capabilities(),
                 "provisional": true,
             }),
         ),
@@ -396,6 +549,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                                 zedlink_retry_value(view.read(cx).zedlink_retry_status());
                             json!({
                                 "thread_id": id,
+                                "agent": thread_agent_value(&view, cx),
                                 "title": thread.title().map(|title| title.to_string()),
                                 "status": format!("{:?}", thread.status()),
                                 "current_turn_id": thread.current_turn_id(),
@@ -430,10 +584,33 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             else {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             };
+            let server_view = view.read(cx).server_view.upgrade();
             let thread = thread.read(cx);
             let agent_error =
                 zedlink_error_value(thread.had_error(), view.read(cx).zedlink_error_summary());
             let retry_status = zedlink_retry_value(view.read(cx).zedlink_retry_status());
+            let total_entries = thread.entries().len();
+            let image_recovery =
+                thread
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(entry_index, entry)| {
+                        let message = entry.user_message()?;
+                        message
+                            .chunks
+                            .iter()
+                            .any(|chunk| matches!(chunk, acp::ContentBlock::Image(_)))
+                            .then_some(message.client_id.as_ref())
+                            .flatten()
+                            .map(|client_id| {
+                                json!({
+                                    "client_user_message_id": client_id,
+                                    "entry_index": entry_index,
+                                    "entries_removed": total_entries.saturating_sub(entry_index),
+                                })
+                            })
+                    });
             let mut used = 0;
             let mut entries = Vec::new();
             let mut truncated = false;
@@ -475,13 +652,16 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "instance_id": state.instance_id,
                     "epoch": state.epoch,
                     "thread_id": id,
+                    "agent": thread_agent_value(&view, cx),
                     "title": thread.title().map(|title| title.to_string()),
                     "status": format!("{:?}", thread.status()),
                     "current_turn_id": thread.current_turn_id(),
                     "had_error": thread.had_error(),
                     "agent_error": agent_error,
+                    "image_recovery": image_recovery,
                     "retry_status": retry_status,
                     "pending_approvals": pending_approvals(thread, cx),
+                    "subagents": subagent_snapshots(thread, server_view.as_ref(), cx),
                     "entries_markdown": entries,
                     "truncated": truncated,
                     "activity_entries_markdown": activity_entries,
@@ -551,6 +731,8 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         "changes.unstage" => change_stage(&request, state, false, cx),
         "thread.send" => send_request(&request, state, cx),
         "thread.cancel" => cancel_request(&request, state, cx),
+        "subagent.cancel" => cancel_subagent_request(&request, state, cx),
+        "thread.rewind_image" => rewind_image_request(&request, state, cx),
         "thread.approvals" => approval_list(&request, state, cx),
         "approval.respond" => approval_response(&request, state, cx),
         _ => error(&request.request_id, "UNSUPPORTED_CAPABILITY"),
@@ -709,6 +891,14 @@ fn creation_result(request_id: &str, record: &CreationRecord) -> Value {
 }
 
 fn pending_approvals(thread: &AcpThread, cx: &App) -> Vec<Value> {
+    pending_approvals_for_session(thread, None, cx)
+}
+
+fn pending_approvals_for_session(
+    thread: &AcpThread,
+    subagent_id: Option<&str>,
+    cx: &App,
+) -> Vec<Value> {
     let turn_id = thread.current_turn_id();
     thread
         .entries()
@@ -730,7 +920,7 @@ fn pending_approvals(thread: &AcpThread, cx: &App) -> Vec<Value> {
                 .filter(|input| input.to_string().len() <= MAX_APPROVAL_INPUT_BYTES);
             let tool_name = tool_call.tool_name.as_ref().map(|name| name.to_string());
             let details_available = raw_input.is_some() && tool_name.is_some();
-            Some(json!({
+            let mut approval = json!({
                 "approval_id": tool_call.id.0.as_ref(),
                 "turn_id": turn_id,
                 "tool_name": tool_name,
@@ -739,8 +929,81 @@ fn pending_approvals(thread: &AcpThread, cx: &App) -> Vec<Value> {
                 "details_truncated": !details_available,
                 "can_approve_once": details_available && options.allow_once_option_id().is_some(),
                 "can_deny_once": options.deny_once_option_id().is_some(),
-            }))
+            });
+            if let Some(subagent_id) = subagent_id {
+                approval["subagent_id"] = json!(subagent_id);
+            }
+            Some(approval)
         })
+        .collect()
+}
+
+fn subagent_snapshots(
+    root: &AcpThread,
+    server_view: Option<&Entity<ConversationView>>,
+    cx: &App,
+) -> Vec<Value> {
+    root.entries()
+        .iter()
+        .filter_map(|entry| {
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                return None;
+            };
+            let info = tool_call.subagent_session_info.as_ref()?;
+            let session_id = info.session_id.to_string();
+            let label = tool_call
+                .label
+                .read(cx)
+                .source()
+                .chars()
+                .take(256)
+                .collect::<String>();
+            let mut snapshot = json!({
+                "session_id": session_id,
+                "tool_call_id": tool_call.id.0.as_ref(),
+                "label": label,
+                "status": tool_call.status.to_string(),
+                "message_start_index": info.message_start_index,
+                "message_end_index": info.message_end_index,
+                "current_turn_id": null,
+                "title": null,
+                "entries_markdown": [],
+                "entries_truncated": false,
+                "pending_approvals": [],
+            });
+            let Some(child_view) =
+                server_view.and_then(|view| view.read(cx).thread_view(&info.session_id))
+            else {
+                return Some(snapshot);
+            };
+            let child = child_view.read(cx).thread.clone();
+            let child = child.read(cx);
+            let mut used = 0;
+            let mut entries = Vec::new();
+            let mut truncated = false;
+            for entry in child.entries().iter().rev() {
+                let markdown = entry.to_markdown(cx);
+                if used + markdown.len() > MAX_SUBAGENT_SNAPSHOT_BYTES {
+                    truncated = true;
+                    break;
+                }
+                used += markdown.len();
+                entries.push(markdown);
+            }
+            entries.reverse();
+            let current_turn_id = child.current_turn_id();
+            if current_turn_id.is_some() {
+                snapshot["status"] = json!(format!("{:?}", child.status()));
+            }
+            snapshot["current_turn_id"] = json!(current_turn_id);
+            snapshot["title"] = json!(child.title().map(|title| title.to_string()));
+            snapshot["entries_markdown"] = json!(entries);
+            snapshot["entries_truncated"] = json!(truncated);
+            snapshot["pending_approvals"] =
+                json!(pending_approvals_for_session(&child, Some(&session_id), cx));
+            Some(snapshot)
+        })
+        .take(MAX_SUBAGENTS_PER_SNAPSHOT)
         .collect()
 }
 
@@ -751,15 +1014,23 @@ fn approval_list(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some(thread) = loaded_threads(&state.project_root, cx)
+    let Some((thread, view)) = loaded_thread_views(&state.project_root, cx)
         .into_iter()
-        .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
+        .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)
     else {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     };
+    let server_view = view.read(cx).server_view.upgrade();
+    let thread = thread.read(cx);
+    let mut approvals = pending_approvals(thread, cx);
+    for subagent in subagent_snapshots(thread, server_view.as_ref(), cx) {
+        if let Some(child_approvals) = subagent["pending_approvals"].as_array() {
+            approvals.extend(child_approvals.iter().cloned());
+        }
+    }
     success(
         &request.request_id,
-        json!({"thread_id": thread_id, "approvals": pending_approvals(thread.read(cx), cx), "provisional": true}),
+        json!({"thread_id": thread_id, "approvals": approvals, "provisional": true}),
     )
 }
 
@@ -791,12 +1062,21 @@ fn approval_response(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -
     if !state.exposed_threads.borrow().contains(thread_id) {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     }
-    let Some(thread) = loaded_threads(&state.project_root, cx)
-        .into_iter()
-        .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
-    else {
-        return error(&request.request_id, "THREAD_NOT_EXPOSED");
-    };
+    let thread =
+        if let Some(subagent_id) = request.params.get("subagent_id").and_then(Value::as_str) {
+            match exposed_subagent_thread_view(thread_id, subagent_id, state, cx) {
+                Ok((thread, _)) => thread,
+                Err(code) => return error(&request.request_id, code),
+            }
+        } else {
+            let Some(thread) = loaded_threads(&state.project_root, cx)
+                .into_iter()
+                .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
+            else {
+                return error(&request.request_id, "THREAD_NOT_EXPOSED");
+            };
+            thread
+        };
     if thread.read(cx).current_turn_id() != Some(turn_id) {
         return error(&request.request_id, "STALE_TURN");
     }
@@ -876,6 +1156,166 @@ fn cancel_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> V
     )
 }
 
+fn exposed_subagent_thread_view(
+    parent_thread_id: &str,
+    subagent_id: &str,
+    state: &ProbeState,
+    cx: &App,
+) -> Result<(Entity<AcpThread>, Entity<ThreadView>), &'static str> {
+    if !state.exposed_threads.borrow().contains(parent_thread_id) {
+        return Err("THREAD_NOT_EXPOSED");
+    }
+    let Some((parent, parent_view)) = loaded_thread_views(&state.project_root, cx)
+        .into_iter()
+        .find(|(thread, _)| thread.read(cx).session_id().to_string() == parent_thread_id)
+    else {
+        return Err("THREAD_NOT_EXPOSED");
+    };
+    let session_id = acp::SessionId::new(subagent_id);
+    if parent
+        .read(cx)
+        .tool_call_for_subagent(&session_id)
+        .is_none()
+    {
+        return Err("SUBAGENT_NOT_FOUND");
+    }
+    let Some(server_view) = parent_view.read(cx).server_view.upgrade() else {
+        return Err("SUBAGENT_NOT_FOUND");
+    };
+    let Some(view) = server_view.read(cx).thread_view(&session_id) else {
+        return Err("SUBAGENT_NOT_FOUND");
+    };
+    let thread = view.read(cx).thread.clone();
+    Ok((thread, view))
+}
+
+fn cancel_subagent_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let Some(parent_thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(subagent_id) = request.params.get("subagent_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(turn_id) = request
+        .params
+        .get("turn_id")
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+    else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
+        || request.params.get("epoch").and_then(Value::as_str) != Some(state.epoch.as_str())
+    {
+        return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    }
+    let (thread, view) =
+        match exposed_subagent_thread_view(parent_thread_id, subagent_id, state, cx) {
+            Ok(value) => value,
+            Err(code) => return error(&request.request_id, code),
+        };
+    if thread.read(cx).current_turn_id() != Some(turn_id) {
+        return error(&request.request_id, "STALE_TURN");
+    }
+    view.update(cx, |view, cx| view.cancel_generation(cx));
+    success(
+        &request.request_id,
+        json!({"outcome": "requested", "subagent_id": subagent_id, "turn_id": turn_id, "provisional": true}),
+    )
+}
+
+fn rewind_image_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let thread = match exposed_thread_for_request(request, state, cx) {
+        Ok(thread) => thread,
+        Err(code) => return error(&request.request_id, code),
+    };
+    let digest = match payload_digest(&request.params) {
+        Ok(digest) => digest,
+        Err(code) => return error(&request.request_id, code),
+    };
+    if let Some(operation) = state.change_operations.borrow().get(&request.request_id) {
+        if operation.payload_digest != digest {
+            return error(&request.request_id, "REQUEST_CONFLICT");
+        }
+        return change_operation_result(&request.request_id, &operation.state);
+    }
+    if state.change_operations.borrow().len() >= 128 {
+        return error(&request.request_id, "RATE_LIMITED");
+    }
+    if thread.read(cx).status() != ThreadStatus::Idle {
+        return error(&request.request_id, "THREAD_BUSY");
+    }
+    let Some(expected_sequence) = request
+        .params
+        .get("expected_last_sequence")
+        .and_then(Value::as_u64)
+    else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if state
+        .events
+        .borrow()
+        .get(thread_id)
+        .map_or(0, |events| events.last_sequence)
+        != expected_sequence
+    {
+        return error(&request.request_id, "STALE_SEQUENCE");
+    }
+    let Some(client_id_value) = request.params.get("client_user_message_id") else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Ok(client_id) =
+        serde_json::from_value::<acp_thread::ClientUserMessageId>(client_id_value.clone())
+    else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let first_image_client_id = thread.read(cx).entries().iter().find_map(|entry| {
+        let message = entry.user_message()?;
+        message
+            .chunks
+            .iter()
+            .any(|chunk| matches!(chunk, acp::ContentBlock::Image(_)))
+            .then_some(message.client_id.clone())
+            .flatten()
+    });
+    if first_image_client_id.as_ref() != Some(&client_id) {
+        return error(&request.request_id, "STALE_SEQUENCE");
+    }
+
+    let task = thread.update(cx, |thread, cx| thread.rewind(client_id, cx));
+    state.change_operations.borrow_mut().insert(
+        request.request_id.clone(),
+        ChangeOperationRecord {
+            payload_digest: digest,
+            state: ChangeOperationState::Running,
+        },
+    );
+    let probe_state = cx.global::<ProbeGlobal>().0.clone();
+    let request_id = request.request_id.clone();
+    cx.spawn(async move |_cx| {
+        let next_state = if task.await.is_ok() {
+            ChangeOperationState::Succeeded
+        } else {
+            ChangeOperationState::Failed
+        };
+        if let Some(operation) = probe_state
+            .change_operations
+            .borrow_mut()
+            .get_mut(&request_id)
+        {
+            operation.state = next_state;
+        }
+    })
+    .detach();
+    success(
+        &request.request_id,
+        json!({"outcome": "running", "provisional": true}),
+    )
+}
+
 fn command_list(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
     let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
@@ -926,12 +1366,13 @@ fn thread_settings(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> 
     {
         return error(&request.request_id, "INSTANCE_UNAVAILABLE");
     }
-    let Some((thread, native_thread)) = exposed_native_thread(thread_id, state, cx) else {
+    let Some((thread, view)) = exposed_thread_view(thread_id, state, cx) else {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
     };
+    let native_thread = view.read(cx).as_native_thread(cx);
     success(
         &request.request_id,
-        thread_settings_value(thread_id, &thread, &native_thread, cx),
+        thread_settings_value(thread_id, &thread, &view, native_thread.as_ref(), cx),
     )
 }
 
@@ -970,8 +1411,11 @@ fn update_thread_settings(request: &ProbeRequest, state: &ProbeState, cx: &mut A
     if profile_id.is_none() && thinking_enabled.is_none() {
         return error(&request.request_id, "INVALID_REQUEST");
     }
-    let Some((thread, native_thread)) = exposed_native_thread(thread_id, state, cx) else {
+    let Some((thread, view)) = exposed_thread_view(thread_id, state, cx) else {
         return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    };
+    let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
+        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
     };
     if thread.read(cx).status() != ThreadStatus::Idle {
         return error(&request.request_id, "THREAD_BUSY");
@@ -1000,31 +1444,49 @@ fn update_thread_settings(request: &ProbeRequest, state: &ProbeState, cx: &mut A
     });
     success(
         &request.request_id,
-        thread_settings_value(thread_id, &thread, &native_thread, cx),
+        thread_settings_value(thread_id, &thread, &view, Some(&native_thread), cx),
     )
 }
 
-fn exposed_native_thread(
+fn exposed_thread_view(
     thread_id: &str,
     state: &ProbeState,
     cx: &App,
-) -> Option<(Entity<AcpThread>, Entity<agent::Thread>)> {
+) -> Option<(Entity<AcpThread>, Entity<ThreadView>)> {
     if !state.exposed_threads.borrow().contains(thread_id) {
         return None;
     }
     let (thread, view) = loaded_thread_views(&state.project_root, cx)
         .into_iter()
         .find(|(thread, _)| thread.read(cx).session_id().to_string() == thread_id)?;
-    let native_thread = view.read(cx).as_native_thread(cx)?;
-    Some((thread, native_thread))
+    Some((thread, view))
 }
 
 fn thread_settings_value(
     thread_id: &str,
     thread: &Entity<AcpThread>,
-    native_thread: &Entity<agent::Thread>,
+    view: &Entity<ThreadView>,
+    native_thread: Option<&Entity<agent::Thread>>,
     cx: &App,
 ) -> Value {
+    let agent = thread_agent_value(view, cx);
+    let Some(native_thread) = native_thread else {
+        return json!({
+            "thread_id": thread_id,
+            "status": format!("{:?}", thread.read(cx).status()),
+            "agent": agent,
+            "model": Value::Null,
+            "profile_id": Value::Null,
+            "profiles": [],
+            "thinking_enabled": Value::Null,
+            "supports_images": Value::Null,
+            "thinking_supported": false,
+            "thinking_can_disable": false,
+            "editable": false,
+            "configuration_owner": "external_agent",
+            "provisional": true,
+        });
+    };
     let native = native_thread.read(cx);
     let model = native.model();
     let profiles = AgentProfile::available_profiles(cx)
@@ -1034,6 +1496,7 @@ fn thread_settings_value(
     json!({
         "thread_id": thread_id,
         "status": format!("{:?}", thread.read(cx).status()),
+        "agent": agent,
         "model": model.map(|model| json!({
             "id": model.id().0.to_string(),
             "name": model.name().0.to_string(),
@@ -1042,9 +1505,21 @@ fn thread_settings_value(
         "profile_id": native.profile().as_str(),
         "profiles": profiles,
         "thinking_enabled": native.thinking_enabled(),
+        "supports_images": model.is_some_and(|model| model.supports_images()),
         "thinking_supported": model.is_some_and(|model| model.supports_thinking()),
         "thinking_can_disable": model.is_some_and(|model| model.supports_disabling_thinking()),
+        "editable": true,
+        "configuration_owner": "zed",
         "provisional": true,
+    })
+}
+
+fn thread_agent_value(view: &Entity<ThreadView>, cx: &App) -> Value {
+    let view = view.read(cx);
+    json!({
+        "id": view.agent_id.to_string(),
+        "name": view.agent_display_name.to_string(),
+        "kind": if view.as_native_thread(cx).is_some() { "zed" } else { "external_acp" },
     })
 }
 
@@ -1991,9 +2466,6 @@ fn loaded_thread_views(
         };
         for conversation in panel.read(cx).conversation_views() {
             let conversation = conversation.read(cx);
-            if conversation.as_native_thread(cx).is_none() {
-                continue;
-            }
             let Some(view) = conversation.root_thread_view() else {
                 continue;
             };

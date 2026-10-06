@@ -332,6 +332,152 @@ pub struct SettingsContent {
     /// Settings for developer-oriented instrumentation tools (profilers,
     /// tracers, etc.) that can be toggled at runtime.
     pub instrumentation: Option<InstrumentationSettingsContent>,
+
+    /// Configuration for the local ZedLink bridge used to expose explicitly
+    /// selected Agent threads to a paired private gateway.
+    pub zedlink: Option<ZedLinkSettingsContent>,
+}
+
+/// Configuration for ZedLink's local Unix socket bridge.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ZedLinkSettingsContent {
+    /// Starts the local bridge when this Zed instance launches.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+
+    /// Absolute path to ZedLink's private state directory. The bridge socket is
+    /// created in its `probe` child directory.
+    pub state_directory: Option<String>,
+
+    /// Absolute path of the one project whose explicitly exposed Agent threads
+    /// may be controlled through ZedLink.
+    pub project_root: Option<String>,
+
+    /// Starts the configured ZedLink gateway when the local bridge starts.
+    ///
+    /// Default: true
+    pub start_gateway_on_launch: Option<bool>,
+
+    /// Absolute path to the ZedLink manager used to start the configured
+    /// gateway without duplicating route or TLS settings in Zed.
+    pub manager_path: Option<String>,
+
+    /// Allows paired devices to create new native Agent sessions in the
+    /// configured project.
+    ///
+    /// Default: true
+    pub allow_session_creation: Option<bool>,
+
+    /// Allows paired devices to add project files or uploaded files to a
+    /// prompt.
+    ///
+    /// Default: true
+    pub allow_attachments: Option<bool>,
+
+    /// Allows paired devices to browse and search files in the configured
+    /// project.
+    ///
+    /// Default: true
+    pub allow_project_context: Option<bool>,
+
+    /// Allows paired devices to inspect, stage, and unstage project changes.
+    ///
+    /// Default: true
+    pub allow_git_changes: Option<bool>,
+
+    /// Allows paired devices to resolve pending Agent approvals.
+    ///
+    /// Default: true
+    pub allow_approval_decisions: Option<bool>,
+
+    /// Allows paired devices to change the native Agent profile and model
+    /// thinking setting for an exposed thread.
+    ///
+    /// Default: true
+    pub allow_agent_settings: Option<bool>,
+
+    /// Identifier of the connection profile edited by the ZedLink Connections
+    /// settings page.
+    pub connection_id: Option<String>,
+
+    /// Display name of the connection profile edited in Zed Settings.
+    pub connection_label: Option<String>,
+
+    /// Network provider used by the edited connection profile.
+    pub connection_provider: Option<ZedLinkConnectionProvider>,
+
+    /// Whether the edited connection profile should accept connections.
+    ///
+    /// Default: true
+    pub connection_enabled: Option<bool>,
+
+    /// Private or loopback listener address in `IP:PORT` form.
+    pub connection_bind: Option<String>,
+
+    /// Trusted HTTPS origin opened by remote clients.
+    pub connection_url: Option<String>,
+
+    /// Absolute path to the TLS certificate served by the local gateway.
+    pub connection_tls_certificate: Option<String>,
+
+    /// Absolute path to the matching private TLS key.
+    pub connection_tls_private_key: Option<String>,
+
+    /// TLS server name used between a proxy frontend and the loopback gateway.
+    pub connection_origin_tls_name: Option<String>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+pub enum ZedLinkConnectionProvider {
+    #[default]
+    #[serde(rename = "tailscale")]
+    #[strum(serialize = "Tailscale")]
+    Tailscale,
+    #[serde(rename = "netbird")]
+    #[strum(serialize = "NetBird")]
+    NetBird,
+    #[serde(rename = "wireguard")]
+    #[strum(serialize = "WireGuard")]
+    WireGuard,
+    #[serde(rename = "zerotier")]
+    #[strum(serialize = "ZeroTier")]
+    ZeroTier,
+    #[serde(rename = "twingate")]
+    #[strum(serialize = "Twingate")]
+    Twingate,
+    #[serde(rename = "headscale")]
+    #[strum(serialize = "Headscale")]
+    Headscale,
+    #[serde(rename = "cloudflare")]
+    #[strum(serialize = "Cloudflare Tunnel + Access")]
+    Cloudflare,
+    #[serde(rename = "ssh-reverse")]
+    #[strum(serialize = "SSH Reverse Tunnel + VPS/Caddy")]
+    SshReverse,
+    #[serde(rename = "ssh-local")]
+    #[strum(serialize = "Direct SSH Forwarding")]
+    SshLocal,
+    #[serde(rename = "lan")]
+    #[strum(serialize = "Local LAN HTTPS")]
+    Lan,
+    #[serde(rename = "custom")]
+    #[strum(serialize = "Custom Private HTTPS")]
+    Custom,
 }
 
 /// Configuration for developer-oriented instrumentation tools that collect
@@ -409,7 +555,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation,
+        instrumentation, zedlink,
     },
     defaults: {},
 });

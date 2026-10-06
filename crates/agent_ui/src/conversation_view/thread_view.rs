@@ -1165,7 +1165,7 @@ impl ThreadView {
             }
             #[cfg(unix)]
             PromptLocalCommand::RemoteControl => {
-                if self.parent_session_id.is_some() || self.as_native_thread(cx).is_none() {
+                if self.parent_session_id.is_some() {
                     return;
                 }
                 match crate::zedlink_probe::toggle_thread_exposure(&self.thread, cx) {
@@ -7133,10 +7133,7 @@ impl ThreadView {
         }
 
         #[cfg(unix)]
-        if self.parent_session_id.is_none()
-            && self.as_native_thread(cx).is_some()
-            && crate::zedlink_probe::is_available(cx)
-        {
+        if self.parent_session_id.is_none() && crate::zedlink_probe::is_available(cx) {
             commands.push(PromptLocalCommand::RemoteControl);
         }
 
