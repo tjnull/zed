@@ -38,7 +38,8 @@ use crate::conversation_view::{ConversationView, ThreadView};
 use crate::{Agent, AgentThreadSource};
 
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_PAGE_BYTES: usize = 256 * 1024;
+const MAX_TRANSCRIPT_PAGE_ENTRIES: usize = 128;
 const MAX_ACTIVITY_BYTES: usize = 256 * 1024;
 const MAX_SUBAGENT_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_SUBAGENTS_PER_SNAPSHOT: usize = 32;
@@ -97,6 +98,7 @@ impl ProbePermissions {
         let mut capabilities = vec![
             "thread.list",
             "thread.snapshot",
+            "thread.history",
             "thread.events",
             "thread.commands",
             "thread.settings",
@@ -441,6 +443,30 @@ fn event_kind(event: &AcpThreadEvent) -> &'static str {
     }
 }
 
+fn transcript_page(
+    thread: &AcpThread,
+    before_entry_index: usize,
+    max_entries: usize,
+    cx: &App,
+) -> (usize, usize, Vec<String>) {
+    let end = before_entry_index.min(thread.entries().len());
+    let mut used = 0;
+    let mut entries = Vec::new();
+    for entry in thread.entries()[..end].iter().rev() {
+        let markdown = entry.to_markdown(cx);
+        if !entries.is_empty()
+            && (entries.len() >= max_entries || used + markdown.len() > MAX_TRANSCRIPT_PAGE_BYTES)
+        {
+            break;
+        }
+        used += markdown.len();
+        entries.push(markdown);
+    }
+    entries.reverse();
+    let start = end.saturating_sub(entries.len());
+    (start, end, entries)
+}
+
 pub(crate) fn is_available(cx: &App) -> bool {
     cx.has_global::<ProbeGlobal>()
 }
@@ -590,6 +616,15 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                 zedlink_error_value(thread.had_error(), view.read(cx).zedlink_error_summary());
             let retry_status = zedlink_retry_value(view.read(cx).zedlink_retry_status());
             let total_entries = thread.entries().len();
+            let tail_entry_count = request
+                .params
+                .get("tail_entry_count")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(MAX_TRANSCRIPT_PAGE_ENTRIES);
+            if tail_entry_count == 0 || tail_entry_count > MAX_TRANSCRIPT_PAGE_ENTRIES {
+                return error(&request.request_id, "INVALID_REQUEST");
+            }
             let image_recovery =
                 thread
                     .entries()
@@ -611,41 +646,37 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                                 })
                             })
                     });
-            let mut used = 0;
-            let mut entries = Vec::new();
-            let mut truncated = false;
-            for entry in thread.entries() {
-                let markdown = entry.to_markdown(cx);
-                if used + markdown.len() > MAX_SNAPSHOT_BYTES {
-                    truncated = true;
-                    break;
-                }
-                used += markdown.len();
-                entries.push(markdown);
-            }
-            // Keep a separate bounded tail for live activity. The compatible transcript
-            // projection above is prefix-capped, so a long thread would otherwise hide
-            // the currently streaming assistant thought or tool update.
-            let mut activity_used = 0;
-            let mut activity_entries = Vec::new();
-            let mut activity_truncated = false;
-            for entry in thread.entries().iter().rev() {
-                let markdown = entry.to_markdown(cx);
-                if activity_used + markdown.len() > MAX_ACTIVITY_BYTES {
-                    activity_truncated = true;
-                    if activity_entries.is_empty() {
-                        let mut end = MAX_ACTIVITY_BYTES.min(markdown.len());
-                        while !markdown.is_char_boundary(end) {
-                            end -= 1;
+            let (entry_start_index, entry_end_index, entries) =
+                transcript_page(thread, total_entries, tail_entry_count, cx);
+            let truncated = entry_start_index > 0;
+            // Retain the older activity projection for compatible clients. Updated clients
+            // render the indexed transcript tail directly and request a smaller live tail.
+            let (activity_entries, activity_truncated) =
+                if request.params.get("tail_entry_count").is_some() {
+                    (entries.clone(), truncated)
+                } else {
+                    let mut activity_used = 0;
+                    let mut activity_entries = Vec::new();
+                    let mut activity_truncated = false;
+                    for entry in thread.entries().iter().rev() {
+                        let markdown = entry.to_markdown(cx);
+                        if activity_used + markdown.len() > MAX_ACTIVITY_BYTES {
+                            activity_truncated = true;
+                            if activity_entries.is_empty() {
+                                let mut end = MAX_ACTIVITY_BYTES.min(markdown.len());
+                                while !markdown.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                activity_entries.push(markdown[..end].to_string());
+                            }
+                            break;
                         }
-                        activity_entries.push(markdown[..end].to_string());
+                        activity_used += markdown.len();
+                        activity_entries.push(markdown);
                     }
-                    break;
-                }
-                activity_used += markdown.len();
-                activity_entries.push(markdown);
-            }
-            activity_entries.reverse();
+                    activity_entries.reverse();
+                    (activity_entries, activity_truncated)
+                };
             success(
                 &request.request_id,
                 json!({
@@ -663,11 +694,57 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "pending_approvals": pending_approvals(thread, cx),
                     "subagents": subagent_snapshots(thread, server_view.as_ref(), cx),
                     "entries_markdown": entries,
+                    "entry_start_index": entry_start_index,
+                    "entry_end_index": entry_end_index,
+                    "total_entries": total_entries,
+                    "has_older_entries": entry_start_index > 0,
                     "truncated": truncated,
                     "activity_entries_markdown": activity_entries,
                     "activity_truncated": activity_truncated,
                     "provisional": true,
                     "last_sequence": state.events.borrow().get(id).map_or(0, |events| events.last_sequence),
+                }),
+            )
+        }
+        "thread.history" => {
+            let Some(id) = request.params.get("thread_id").and_then(Value::as_str) else {
+                return error(&request.request_id, "INVALID_REQUEST");
+            };
+            if !state.exposed_threads.borrow().contains(id) {
+                return error(&request.request_id, "THREAD_NOT_EXPOSED");
+            }
+            let Some(thread) = loaded_threads(&state.project_root, cx)
+                .into_iter()
+                .find(|thread| thread.read(cx).session_id().to_string() == id)
+            else {
+                return error(&request.request_id, "THREAD_NOT_EXPOSED");
+            };
+            let thread = thread.read(cx);
+            let total_entries = thread.entries().len();
+            let before_entry_index = request
+                .params
+                .get("before_entry_index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(total_entries);
+            if before_entry_index > total_entries {
+                return error(&request.request_id, "RESYNC_REQUIRED");
+            }
+            let (entry_start_index, entry_end_index, entries) =
+                transcript_page(thread, before_entry_index, MAX_TRANSCRIPT_PAGE_ENTRIES, cx);
+            success(
+                &request.request_id,
+                json!({
+                    "instance_id": state.instance_id,
+                    "epoch": state.epoch,
+                    "thread_id": id,
+                    "entries_markdown": entries,
+                    "entry_start_index": entry_start_index,
+                    "entry_end_index": entry_end_index,
+                    "total_entries": total_entries,
+                    "has_older_entries": entry_start_index > 0,
+                    "last_sequence": state.events.borrow().get(id).map_or(0, |events| events.last_sequence),
+                    "provisional": true,
                 }),
             )
         }
