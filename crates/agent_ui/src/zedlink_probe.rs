@@ -110,7 +110,12 @@ impl ProbePermissions {
             "request.status",
         ];
         if self.session_creation {
-            capabilities.push("thread.create");
+            capabilities.extend([
+                "thread.create",
+                "thread.create.options",
+                "thread.rename",
+                "thread.unexpose",
+            ]);
         }
         if self.attachments {
             capabilities.extend(["thread.attachments", "thread.rewind_image"]);
@@ -137,7 +142,9 @@ impl ProbePermissions {
 
     fn allows(self, method: &str, params: &Value) -> bool {
         match method {
-            "thread.create" => self.session_creation,
+            "thread.create" | "thread.create.options" | "thread.rename" | "thread.unexpose" => {
+                self.session_creation
+            }
             "thread.rewind_image" => self.attachments,
             "thread.send"
                 if params.get("context_paths").is_some() || params.get("uploads").is_some() =>
@@ -173,6 +180,7 @@ struct SubmissionRecord {
 
 struct CreationRecord {
     title: Option<String>,
+    agent_id: String,
     thread_id: Option<String>,
 }
 
@@ -525,6 +533,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                 "instance_id": state.instance_id,
                 "epoch": state.epoch,
                 "capabilities": state.permissions.capabilities(),
+                "project": state.project_root.file_name().and_then(|name| name.to_str()),
                 "provisional": true,
             }),
         ),
@@ -597,6 +606,9 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             )
         }
         "thread.create" => create_thread(&request, state, cx),
+        "thread.create.options" => create_thread_options(&request, state, cx),
+        "thread.rename" => rename_thread(&request, state, cx),
+        "thread.unexpose" => unexpose_thread(&request, state),
         "thread.snapshot" => {
             let Some(id) = request.params.get("thread_id").and_then(Value::as_str) else {
                 return error(&request.request_id, "INVALID_REQUEST");
@@ -836,11 +848,18 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         }
         _ => return error(&request.request_id, "INVALID_REQUEST"),
     };
+    let agent_id = match request.params.get("agent_id") {
+        None | Some(Value::Null) => agent::ZED_AGENT_ID.0.to_string(),
+        Some(Value::String(agent_id)) if !agent_id.is_empty() && agent_id.len() <= 128 => {
+            agent_id.clone()
+        }
+        _ => return error(&request.request_id, "INVALID_REQUEST"),
+    };
 
     {
         let creations = state.creations.borrow();
         if let Some(previous) = creations.get(&request.request_id) {
-            if previous.title != title {
+            if previous.title != title || previous.agent_id != agent_id {
                 return error(&request.request_id, "REQUEST_CONFLICT");
             }
             return creation_result(&request.request_id, previous);
@@ -856,18 +875,37 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         .workspaces()
         .filter_map(|workspace| workspace.upgrade())
         .find_map(|workspace| {
-            let matches_project = workspace
-                .read(cx)
-                .project()
+            let workspace = workspace.read(cx);
+            let project = workspace.project().clone();
+            let matches_project = project
                 .read(cx)
                 .visible_worktrees(cx)
                 .any(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root);
             matches_project
-                .then(|| workspace.read(cx).panel::<AgentPanel>(cx))
+                .then(|| {
+                    workspace
+                        .panel::<AgentPanel>(cx)
+                        .map(|panel| (panel, project))
+                })
                 .flatten()
         });
-    let Some(panel) = panel else {
+    let Some((panel, project)) = panel else {
         return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    };
+    let agent = if agent_id == agent::ZED_AGENT_ID.as_ref() {
+        Agent::NativeAgent
+    } else {
+        let store = project.read(cx).agent_server_store().clone();
+        if !store
+            .read(cx)
+            .external_agents()
+            .any(|known| known.0.as_ref() == agent_id)
+        {
+            return error(&request.request_id, "INVALID_REQUEST");
+        }
+        Agent::Custom {
+            id: project::AgentId(agent_id.clone().into()),
+        }
     };
 
     let created = cx.with_window(panel.entity_id(), |window, cx| {
@@ -875,7 +913,7 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             let thread_id = panel.create_thread_with_options(
                 CreateThreadOptions {
                     title: title.clone().map(Into::into),
-                    agent: Some(Agent::NativeAgent),
+                    agent: Some(agent),
                     ..Default::default()
                 },
                 AgentThreadSource::AgentPanel,
@@ -897,6 +935,7 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         request.request_id.clone(),
         CreationRecord {
             title,
+            agent_id,
             thread_id: None,
         },
     );
@@ -920,6 +959,116 @@ fn create_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         creations
             .get(&request.request_id)
             .expect("creation record inserted"),
+    )
+}
+
+fn create_thread_options(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    let panel = workspace::AppState::global(cx)
+        .workspace_store
+        .read(cx)
+        .workspaces()
+        .filter_map(|workspace| workspace.upgrade())
+        .find_map(|workspace| {
+            let workspace = workspace.read(cx);
+            let project = workspace.project().clone();
+            let matches_project = project
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == state.project_root);
+            matches_project
+                .then(|| {
+                    workspace
+                        .panel::<AgentPanel>(cx)
+                        .map(|panel| (panel, project))
+                })
+                .flatten()
+        });
+    let Some((_panel, project)) = panel else {
+        return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    };
+    let agent_store = project.read(cx).agent_server_store().clone();
+    let store = agent_store.read(cx);
+    let mut agents = vec![json!({
+        "id": agent::ZED_AGENT_ID.0.to_string(),
+        "name": "Zed Agent",
+        "kind": "zed",
+    })];
+    for id in store.external_agents() {
+        agents.push(json!({
+            "id": id.0.to_string(),
+            "name": store.agent_display_name(id).unwrap_or_else(|| id.0.clone()),
+            "kind": "external_acp",
+        }));
+    }
+    success(
+        &request.request_id,
+        json!({
+            "instance_id": state.instance_id,
+            "epoch": state.epoch,
+            "project": state.project_root.file_name().and_then(|name| name.to_str()),
+            "agents": agents,
+        }),
+    )
+}
+
+fn rename_thread(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
+        || request.params.get("epoch").and_then(Value::as_str) != Some(state.epoch.as_str())
+    {
+        return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    }
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(title) = request.params.get("title").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let title = title.trim();
+    if title.is_empty() || title.len() > MAX_THREAD_TITLE_BYTES {
+        return error(&request.request_id, "INVALID_REQUEST");
+    }
+    if !state.exposed_threads.borrow().contains(thread_id) {
+        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    }
+    let Some(thread) = loaded_threads(&state.project_root, cx)
+        .into_iter()
+        .find(|thread| thread.read(cx).session_id().to_string() == thread_id)
+    else {
+        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    };
+    let renamed = thread.update(cx, |thread, cx| {
+        if !thread.can_set_title(cx) {
+            return false;
+        }
+        thread.set_title(title.into(), cx).detach();
+        true
+    });
+    if !renamed {
+        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+    }
+    success(
+        &request.request_id,
+        json!({"thread_id": thread_id, "title": title, "outcome": "requested"}),
+    )
+}
+
+fn unexpose_thread(request: &ProbeRequest, state: &ProbeState) -> Value {
+    if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
+        || request.params.get("epoch").and_then(Value::as_str) != Some(state.epoch.as_str())
+    {
+        return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    }
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    if !state.exposed_threads.borrow_mut().remove(thread_id) {
+        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    }
+    state.subscriptions.borrow_mut().remove(thread_id);
+    state.events.borrow_mut().remove(thread_id);
+    success(
+        &request.request_id,
+        json!({"thread_id": thread_id, "outcome": "unexposed"}),
     )
 }
 
