@@ -1120,6 +1120,91 @@ fn pending_approvals(thread: &AcpThread, cx: &App) -> Vec<Value> {
     pending_approvals_for_session(thread, None, cx)
 }
 
+fn permission_option_kind(kind: acp::PermissionOptionKind) -> &'static str {
+    match kind {
+        acp::PermissionOptionKind::AllowOnce => "allow_once",
+        acp::PermissionOptionKind::AllowAlways => "allow_always",
+        acp::PermissionOptionKind::RejectOnce => "reject_once",
+        acp::PermissionOptionKind::RejectAlways => "reject_always",
+        _ => "unknown",
+    }
+}
+
+fn permission_option_value(
+    option: &acp::PermissionOption,
+    choice_index: Option<usize>,
+    action: Option<&'static str>,
+) -> Value {
+    json!({
+        "option_id": option.option_id.0.as_ref(),
+        "label": &option.name,
+        "option_kind": permission_option_kind(option.kind),
+        "choice_index": choice_index,
+        "action": action,
+    })
+}
+
+fn permission_options_value(options: &acp_thread::PermissionOptions) -> Value {
+    match options {
+        acp_thread::PermissionOptions::Flat(options) => json!({
+            "presentation": "flat",
+            "decisions": options
+                .iter()
+                .map(|option| permission_option_value(option, None, None))
+                .collect::<Vec<_>>(),
+            "patterns": [],
+        }),
+        acp_thread::PermissionOptions::Dropdown(choices) => json!({
+            "presentation": "dropdown",
+            "decisions": choices
+                .iter()
+                .enumerate()
+                .flat_map(|(index, choice)| [
+                    permission_option_value(&choice.allow, Some(index), Some("allow")),
+                    permission_option_value(&choice.deny, Some(index), Some("deny")),
+                ])
+                .collect::<Vec<_>>(),
+            "patterns": [],
+        }),
+        acp_thread::PermissionOptions::DropdownWithPatterns {
+            choices, patterns, ..
+        } => {
+            let mut decisions = choices
+                .iter()
+                .enumerate()
+                .flat_map(|(index, choice)| {
+                    [
+                        permission_option_value(&choice.allow, Some(index), Some("allow")),
+                        permission_option_value(&choice.deny, Some(index), Some("deny")),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            if let Some(always) = choices.first() {
+                for (index, pattern) in patterns.iter().enumerate() {
+                    for (option, action) in [(&always.allow, "allow"), (&always.deny, "deny")] {
+                        let mut decision = permission_option_value(option, Some(0), Some(action));
+                        decision["label"] = json!(format!("Always for `{}`", pattern.display_name));
+                        decision["selected_pattern_indices"] = json!([index]);
+                        decisions.push(decision);
+                    }
+                }
+            }
+            json!({
+                "presentation": "dropdown_with_patterns",
+                "decisions": decisions,
+                "patterns": patterns
+                .iter()
+                .enumerate()
+                .map(|(index, pattern)| json!({
+                    "index": index,
+                    "display_name": pattern.display_name,
+                }))
+                .collect::<Vec<_>>(),
+            })
+        }
+    }
+}
+
 fn pending_approvals_for_session(
     thread: &AcpThread,
     subagent_id: Option<&str>,
@@ -1137,9 +1222,6 @@ fn pending_approvals_for_session(
             else {
                 return None;
             };
-            if !matches!(kind, AuthorizationKind::PermissionGrant) {
-                return None;
-            }
             let raw_input = tool_call
                 .raw_input
                 .as_ref()
@@ -1153,6 +1235,11 @@ fn pending_approvals_for_session(
                 "display": tool_call.label.read(cx).source().chars().take(256).collect::<String>(),
                 "raw_input": raw_input,
                 "details_truncated": !details_available,
+                "authorization_kind": match kind {
+                    AuthorizationKind::PermissionGrant => "permission_grant",
+                    AuthorizationKind::ActionChoice => "action_choice",
+                },
+                "permission_options": permission_options_value(options),
                 "can_approve_once": details_available && options.allow_once_option_id().is_some(),
                 "can_deny_once": options.deny_once_option_id().is_some(),
             });
@@ -1275,11 +1362,6 @@ fn approval_response(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -
     else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    let kind = match request.params.get("decision").and_then(Value::as_str) {
-        Some("approve_once") => acp::PermissionOptionKind::AllowOnce,
-        Some("deny_once") => acp::PermissionOptionKind::RejectOnce,
-        _ => return error(&request.request_id, "INVALID_REQUEST"),
-    };
     if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
         || request.params.get("epoch").and_then(Value::as_str) != Some(state.epoch.as_str())
     {
@@ -1320,22 +1402,115 @@ fn approval_response(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -
         else {
             return error(&request.request_id, "APPROVAL_ALREADY_RESOLVED");
         };
-        if !matches!(authorization_kind, AuthorizationKind::PermissionGrant) {
-            return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
-        }
-        if kind == acp::PermissionOptionKind::AllowOnce
-            && (tool_call.tool_name.is_none()
-                || !tool_call
-                    .raw_input
-                    .as_ref()
-                    .is_some_and(|input| input.to_string().len() <= MAX_APPROVAL_INPUT_BYTES))
+        let details_available = tool_call.tool_name.is_some()
+            && tool_call
+                .raw_input
+                .as_ref()
+                .is_some_and(|input| input.to_string().len() <= MAX_APPROVAL_INPUT_BYTES);
+        let outcome = if let Some(decision) = request.params.get("decision").and_then(Value::as_str)
+        {
+            if !matches!(authorization_kind, AuthorizationKind::PermissionGrant) {
+                return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+            }
+            let kind = match decision {
+                "approve_once" => acp::PermissionOptionKind::AllowOnce,
+                "deny_once" => acp::PermissionOptionKind::RejectOnce,
+                _ => return error(&request.request_id, "INVALID_REQUEST"),
+            };
+            let Some(option) = options.first_option_of_kind(kind) else {
+                return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+            };
+            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+        } else {
+            let Some(option_id) = request.params.get("option_id").and_then(Value::as_str) else {
+                return error(&request.request_id, "INVALID_REQUEST");
+            };
+            match options {
+                acp_thread::PermissionOptions::Flat(options) => {
+                    let Some(option) = options
+                        .iter()
+                        .find(|option| option.option_id.0.as_ref() == option_id)
+                    else {
+                        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+                    };
+                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                }
+                acp_thread::PermissionOptions::Dropdown(choices)
+                | acp_thread::PermissionOptions::DropdownWithPatterns { choices, .. } => {
+                    let Some(choice_index) = request
+                        .params
+                        .get("choice_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                    else {
+                        return error(&request.request_id, "INVALID_REQUEST");
+                    };
+                    let Some(choice) = choices.get(choice_index) else {
+                        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+                    };
+                    let is_allow = if choice.allow.option_id.0.as_ref() == option_id {
+                        true
+                    } else if choice.deny.option_id.0.as_ref() == option_id {
+                        false
+                    } else {
+                        return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+                    };
+                    let selected_patterns = request
+                        .params
+                        .get("selected_pattern_indices")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .map(|value| {
+                                    value
+                                        .as_u64()
+                                        .and_then(|index| usize::try_from(index).ok())
+                                        .ok_or(())
+                                })
+                                .collect::<std::result::Result<Vec<_>, _>>()
+                        })
+                        .transpose();
+                    let selected_patterns = match selected_patterns {
+                        Ok(patterns) => patterns,
+                        Err(()) => return error(&request.request_id, "INVALID_REQUEST"),
+                    };
+                    if let Some(indices) = selected_patterns.filter(|indices| !indices.is_empty()) {
+                        if choice_index != 0 {
+                            return error(&request.request_id, "INVALID_REQUEST");
+                        }
+                        let acp_thread::PermissionOptions::DropdownWithPatterns {
+                            patterns, ..
+                        } = options
+                        else {
+                            return error(&request.request_id, "INVALID_REQUEST");
+                        };
+                        if indices.iter().any(|index| *index >= patterns.len()) {
+                            return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+                        }
+                        let Some(outcome) =
+                            options.build_outcome_for_checked_patterns(&indices, is_allow)
+                        else {
+                            return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
+                        };
+                        outcome
+                    } else {
+                        choice.build_outcome(is_allow)
+                    }
+                }
+            }
+        };
+        let is_allow = matches!(
+            outcome.option_kind,
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+        );
+        if (matches!(authorization_kind, AuthorizationKind::PermissionGrant) && is_allow
+            || matches!(authorization_kind, AuthorizationKind::ActionChoice))
+            && !details_available
         {
             return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
         }
-        let Some(option) = options.first_option_of_kind(kind) else {
-            return error(&request.request_id, "UNSUPPORTED_CAPABILITY");
-        };
-        SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+        outcome
     };
     thread.update(cx, |thread, cx| {
         thread.authorize_tool_call(tool_call_id, outcome, cx)
