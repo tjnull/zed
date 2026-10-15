@@ -14,8 +14,8 @@ use std::{
 };
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AuthorizationKind, MessageIdentity,
-    SelectedPermissionOutcome, SubmissionState, ThreadStatus, ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, AuthorizationKind,
+    MessageIdentity, SelectedPermissionOutcome, SubmissionState, ThreadStatus, ToolCallStatus,
 };
 use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentProfile, AgentProfileId};
@@ -192,6 +192,7 @@ impl ProbePermissions {
             "thread.settings",
             "thread.elicitations",
             "thread.queue",
+            "thread.queue.remove",
             "thread.edit_review",
             "thread.send",
             "thread.cancel",
@@ -649,16 +650,11 @@ fn event_kind(event: &AcpThreadEvent) -> &'static str {
     }
 }
 
-fn active_remote_submission(
+fn remote_submission_entry_index(
     thread: &AcpThread,
-    view: &ThreadView,
-) -> (Option<String>, Option<usize>) {
-    if thread.current_turn_id().is_none() {
-        return (None, None);
-    }
-    let Some((submission_id, request_id, entry_start_index)) = view.remote_submission() else {
-        return (None, None);
-    };
+    submission_id: acp_thread::SubmissionId,
+    entry_start_index: usize,
+) -> Option<usize> {
     let receipt_entry_index = thread.submission(submission_id).and_then(|submission| {
         let SubmissionState::Accepted { receipt, .. } = &submission.state else {
             return None;
@@ -670,7 +666,7 @@ fn active_remote_submission(
     });
     // Legacy native responses can lack a keyed receipt. The entry boundary was captured
     // in the same application-thread update that dispatched this exact submission.
-    let entry_index = receipt_entry_index.or_else(|| {
+    receipt_entry_index.or_else(|| {
         thread
             .entries()
             .get(entry_start_index..)
@@ -680,8 +676,56 @@ fn active_remote_submission(
                     .position(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
                     .map(|offset| entry_start_index + offset)
             })
-    });
-    (Some(request_id.to_string()), entry_index)
+    })
+}
+
+fn active_remote_submission(
+    thread: &AcpThread,
+    view: &ThreadView,
+) -> (Option<String>, Option<usize>) {
+    if thread.current_turn_id().is_none() {
+        return (None, None);
+    }
+    let Some((submission_id, request_id, entry_start_index)) = view.remote_submission() else {
+        return (None, None);
+    };
+    (
+        Some(request_id.to_string()),
+        remote_submission_entry_index(thread, submission_id, entry_start_index),
+    )
+}
+
+fn transcript_entry_meta(entry: &AgentThreadEntry, cx: &App) -> Value {
+    match entry {
+        AgentThreadEntry::UserMessage(_) => json!({"kind": "user"}),
+        AgentThreadEntry::AssistantMessage(message) => json!({
+            "kind": "assistant",
+            "segments": message.chunks.iter().map(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. } =>
+                    json!({"kind": "assistant", "text": block.to_markdown(cx)}),
+                AssistantMessageChunk::Thought { block, .. } =>
+                    json!({"kind": "reasoning", "text": block.to_markdown(cx)}),
+            }).collect::<Vec<_>>(),
+        }),
+        AgentThreadEntry::ToolCall(tool) => {
+            let status = match tool.status() {
+                ToolCallStatus::Pending
+                | ToolCallStatus::WaitingForConfirmation
+                | ToolCallStatus::InProgress => "running",
+                ToolCallStatus::Completed => "completed",
+                ToolCallStatus::Failed => "failed",
+                ToolCallStatus::Rejected | ToolCallStatus::Canceled => "canceled",
+            };
+            json!({
+                "kind": "tool",
+                "call_id": tool.id.0.as_ref(),
+                "name": tool.tool_name.as_ref().or(tool.name.as_ref())
+                    .map(ToString::to_string).unwrap_or_else(|| "Zed tool".to_string()),
+                "status": status,
+            })
+        }
+        _ => json!({"kind": "other"}),
+    }
 }
 
 fn transcript_page(
@@ -689,10 +733,11 @@ fn transcript_page(
     before_entry_index: usize,
     max_entries: usize,
     cx: &App,
-) -> (usize, usize, Vec<String>) {
+) -> (usize, usize, Vec<String>, Vec<Value>) {
     let end = before_entry_index.min(thread.entries().len());
     let mut used = 0;
     let mut entries = Vec::new();
+    let mut entry_meta = Vec::new();
     for entry in thread.entries()[..end].iter().rev() {
         let markdown = entry.to_markdown(cx);
         if !entries.is_empty()
@@ -702,10 +747,12 @@ fn transcript_page(
         }
         used += markdown.len();
         entries.push(markdown);
+        entry_meta.push(transcript_entry_meta(entry, cx));
     }
     entries.reverse();
+    entry_meta.reverse();
     let start = end.saturating_sub(entries.len());
-    (start, end, entries)
+    (start, end, entries, entry_meta)
 }
 
 pub(crate) fn is_available(cx: &App) -> bool {
@@ -796,11 +843,21 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             if !state.exposed_threads.borrow().contains(&record.thread_id) {
                 return error(&request.request_id, "THREAD_NOT_EXPOSED");
             }
+            let entry_index = loaded_thread_views(&state.project_root, cx)
+                .into_iter()
+                .find(|(thread, _)| thread.read(cx).session_id().to_string() == record.thread_id)
+                .and_then(|(thread, view)| {
+                    let (submission_id, entry_start_index) = view
+                        .read(cx)
+                        .remote_submission_for_request(original_request_id)?;
+                    remote_submission_entry_index(thread.read(cx), submission_id, entry_start_index)
+                });
             success(
                 &request.request_id,
                 json!({"known": true, "outcome": record.outcome,
                     "native_request_id": original_request_id,
-                    "queue_entry_id": record.queue_entry_id, "provisional": true}),
+                    "queue_entry_id": record.queue_entry_id,
+                    "entry_index": entry_index, "provisional": true}),
             )
         }
         "thread.list" => {
@@ -913,7 +970,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     })
                 })
                 .collect::<Vec<_>>();
-            let (entry_start_index, entry_end_index, entries) =
+            let (entry_start_index, entry_end_index, entries, entry_meta) =
                 transcript_page(thread, total_entries, tail_entry_count, cx);
             let truncated = entry_start_index > 0;
             // Retain the older activity projection for compatible clients. Updated clients
@@ -965,6 +1022,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "pending_approvals": pending_approvals(thread, cx),
                     "subagents": subagent_snapshots(thread, server_view.as_ref(), cx),
                     "entries_markdown": entries,
+                    "entries_meta": entry_meta,
                     "entry_start_index": entry_start_index,
                     "entry_end_index": entry_end_index,
                     "total_entries": total_entries,
@@ -1013,7 +1071,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             if before_entry_index > total_entries {
                 return error(&request.request_id, "RESYNC_REQUIRED");
             }
-            let (entry_start_index, entry_end_index, entries) =
+            let (entry_start_index, entry_end_index, entries, entry_meta) =
                 transcript_page(thread, before_entry_index, MAX_TRANSCRIPT_PAGE_ENTRIES, cx);
             success(
                 &request.request_id,
@@ -1023,6 +1081,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "thread_id": id,
                     "subagent_id": subagent_id,
                     "entries_markdown": entries,
+                    "entries_meta": entry_meta,
                     "entry_start_index": entry_start_index,
                     "entry_end_index": entry_end_index,
                     "total_entries": total_entries,
@@ -1086,6 +1145,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
         "thread.elicitations" => elicitation_list(&request, state, cx),
         "elicitation.respond" => elicitation_response(&request, state, cx),
         "thread.queue" => queue_state(&request, state, cx),
+        "thread.queue.remove" => remove_queued_request(&request, state, cx),
         "thread.queue.clear" => clear_queue(&request, state, cx),
         "thread.edit_review" => edit_review_state(&request, state, cx),
         "thread.edit_review.respond" => edit_review_response(&request, state, cx),
@@ -2535,6 +2595,71 @@ fn queue_state(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Valu
             "count": entries.len(),
         }),
     )
+}
+
+fn remove_queued_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {
+    if !matches_instance(request, state) {
+        return error(&request.request_id, "INSTANCE_UNAVAILABLE");
+    }
+    let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(original_request_id) = request
+        .params
+        .get("original_request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    let Some(queue_entry_id) = request
+        .params
+        .get("queue_entry_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return error(&request.request_id, "INVALID_REQUEST");
+    };
+    {
+        let submissions = state.submissions.borrow();
+        let Some(record) = submissions.get(original_request_id) else {
+            return success(&request.request_id, json!({"outcome": "unknown"}));
+        };
+        if record.thread_id != thread_id || record.queue_entry_id != Some(queue_entry_id) {
+            return error(&request.request_id, "REQUEST_CONFLICT");
+        }
+        if record.outcome == "removed" {
+            return success(&request.request_id, json!({"outcome": "removed"}));
+        }
+    }
+    let Some((_, view)) = exposed_thread_view(thread_id, state, cx) else {
+        return error(&request.request_id, "THREAD_NOT_EXPOSED");
+    };
+    let removed = view.update(cx, |view, cx| {
+        let entry_id = view
+            .message_queue
+            .iter()
+            .find(|entry| {
+                entry.id.as_usize() == queue_entry_id
+                    && entry.remote_request_id.as_deref() == Some(original_request_id)
+            })
+            .map(|entry| entry.id);
+        let Some(entry_id) = entry_id else {
+            return false;
+        };
+        let removed = view.remove_from_queue(entry_id, cx).is_some();
+        if removed {
+            cx.notify();
+        }
+        removed
+    });
+    if !removed {
+        return success(&request.request_id, json!({"outcome": "not_queued"}));
+    }
+    if let Some(record) = state.submissions.borrow_mut().get_mut(original_request_id) {
+        record.outcome = "removed";
+    }
+    success(&request.request_id, json!({"outcome": "removed"}))
 }
 
 fn clear_queue(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Value {

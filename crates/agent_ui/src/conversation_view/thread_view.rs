@@ -623,6 +623,7 @@ pub struct ThreadView {
     pub hovered_edited_file_buttons: Option<usize>,
     pub current_submission: Option<SubmissionId>,
     remote_submission: Option<(SubmissionId, String, usize)>,
+    remote_submissions: std::collections::VecDeque<(SubmissionId, String, usize)>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1063,6 +1064,7 @@ impl ThreadView {
             hovered_edited_file_buttons: None,
             current_submission,
             remote_submission: None,
+            remote_submissions: std::collections::VecDeque::new(),
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
@@ -2128,6 +2130,17 @@ impl ThreadView {
         ))
     }
 
+    pub(crate) fn remote_submission_for_request(
+        &self,
+        request_id: &str,
+    ) -> Option<(SubmissionId, usize)> {
+        self.remote_submissions
+            .iter()
+            .rev()
+            .find(|(_, saved_request_id, _)| saved_request_id == request_id)
+            .map(|(submission_id, _, entry_start_index)| (*submission_id, *entry_start_index))
+    }
+
     fn send_content_with_remote_origin(
         &mut self,
         contents_task: Task<
@@ -2244,8 +2257,14 @@ impl ThreadView {
 
             let _ = this.update(cx, |this, cx| {
                 this.current_submission = Some(submission_id);
-                this.remote_submission = remote_request_id
-                    .map(|request_id| (submission_id, request_id, entry_start_index));
+                this.remote_submission = remote_request_id.map(|request_id| {
+                    let record = (submission_id, request_id, entry_start_index);
+                    this.remote_submissions.push_back(record.clone());
+                    if this.remote_submissions.len() > 256 {
+                        this.remote_submissions.pop_front();
+                    }
+                    record
+                });
                 this.sync_generating_indicator(cx);
                 cx.notify();
             });
