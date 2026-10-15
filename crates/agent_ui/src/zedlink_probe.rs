@@ -14,8 +14,8 @@ use std::{
 };
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AuthorizationKind, SelectedPermissionOutcome,
-    ThreadStatus, ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AuthorizationKind, MessageIdentity,
+    SelectedPermissionOutcome, SubmissionState, ThreadStatus, ToolCallStatus,
 };
 use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentProfile, AgentProfileId};
@@ -316,6 +316,7 @@ struct SubmissionRecord {
     thread_id: String,
     payload_digest: String,
     outcome: &'static str,
+    queue_entry_id: Option<usize>,
 }
 
 struct CreationRecord {
@@ -648,6 +649,41 @@ fn event_kind(event: &AcpThreadEvent) -> &'static str {
     }
 }
 
+fn active_remote_submission(
+    thread: &AcpThread,
+    view: &ThreadView,
+) -> (Option<String>, Option<usize>) {
+    if thread.current_turn_id().is_none() {
+        return (None, None);
+    }
+    let Some((submission_id, request_id, entry_start_index)) = view.remote_submission() else {
+        return (None, None);
+    };
+    let receipt_entry_index = thread.submission(submission_id).and_then(|submission| {
+        let SubmissionState::Accepted { receipt, .. } = &submission.state else {
+            return None;
+        };
+        thread.entries().iter().position(|entry| {
+            matches!(entry, AgentThreadEntry::UserMessage(message)
+                if matches!(&message.identity, MessageIdentity::Keyed(id) if id == &receipt.message_id))
+        })
+    });
+    // Legacy native responses can lack a keyed receipt. The entry boundary was captured
+    // in the same application-thread update that dispatched this exact submission.
+    let entry_index = receipt_entry_index.or_else(|| {
+        thread
+            .entries()
+            .get(entry_start_index..)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .position(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .map(|offset| entry_start_index + offset)
+            })
+    });
+    (Some(request_id.to_string()), entry_index)
+}
+
 fn transcript_page(
     thread: &AcpThread,
     before_entry_index: usize,
@@ -762,7 +798,9 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             }
             success(
                 &request.request_id,
-                json!({"known": true, "outcome": record.outcome, "provisional": true}),
+                json!({"known": true, "outcome": record.outcome,
+                    "native_request_id": original_request_id,
+                    "queue_entry_id": record.queue_entry_id, "provisional": true}),
             )
         }
         "thread.list" => {
@@ -823,6 +861,8 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
             };
             let server_view = view.read(cx).server_view.upgrade();
             let thread = thread.read(cx);
+            let (active_request_id, active_request_entry_index) =
+                active_remote_submission(thread, view.read(cx));
             let agent_error =
                 zedlink_error_value(thread.had_error(), view.read(cx).zedlink_error_summary());
             let retry_status = zedlink_retry_value(view.read(cx).zedlink_retry_status());
@@ -914,6 +954,8 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "title": thread.title().map(|title| title.to_string()),
                     "status": format!("{:?}", thread.status()),
                     "current_turn_id": thread.current_turn_id(),
+                    "active_request_id": active_request_id,
+                    "active_request_entry_index": active_request_entry_index,
                     "had_error": thread.had_error(),
                     "agent_error": agent_error,
                     "image_recovery": image_recovery,
@@ -3441,7 +3483,11 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
         if previous.thread_id != thread_id || previous.payload_digest != payload_digest {
             return error(&request.request_id, "REQUEST_CONFLICT");
         }
-        return send_result(&request.request_id, previous.outcome);
+        return send_result(
+            &request.request_id,
+            previous.outcome,
+            previous.queue_entry_id,
+        );
     }
     if submissions.len() >= 256 {
         return error(&request.request_id, "RATE_LIMITED");
@@ -3542,9 +3588,10 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
                 thread_id: thread_id.to_string(),
                 payload_digest,
                 outcome,
+                queue_entry_id: None,
             },
         );
-        return send_result(&request.request_id, outcome);
+        return send_result(&request.request_id, outcome, None);
     }
     let native_command = selected_command
         .is_some_and(|command| command.get("category").and_then(Value::as_str) == Some("native"));
@@ -3601,9 +3648,10 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
                     thread_id: thread_id.to_string(),
                     payload_digest,
                     outcome: "unknown",
+                    queue_entry_id: None,
                 },
             );
-            return send_result(&request.request_id, "unknown");
+            return send_result(&request.request_id, "unknown", None);
         }
     }
     let can_send_now =
@@ -3628,7 +3676,7 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
                             cx,
                         );
                     }
-                    view.send_content(
+                    view.send_content_from_remote(
                         Task::ready(Ok(Some((
                             vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
                                 "/{name}"
@@ -3636,25 +3684,33 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
                             Vec::new(),
                         )))),
                         true,
+                        request.request_id.clone(),
                         window,
                         cx,
                     );
                 } else {
-                    view.send_content(
+                    view.send_content_from_remote(
                         Task::ready(Ok(Some((content, Vec::new())))),
                         false,
+                        request.request_id.clone(),
                         window,
                         cx,
                     );
                 }
-                "unknown"
+                ("unknown", None)
             } else {
-                view.add_to_queue(content, Vec::new(), window, cx);
-                "queued"
+                let queue_entry_id = view.add_to_queue_from_remote(
+                    content,
+                    Vec::new(),
+                    request.request_id.clone(),
+                    window,
+                    cx,
+                );
+                ("queued", Some(queue_entry_id))
             }
         })
     });
-    let Some(outcome) = sent else {
+    let Some((outcome, queue_entry_id)) = sent else {
         return error(&request.request_id, "INSTANCE_UNAVAILABLE");
     };
     state.submissions.borrow_mut().insert(
@@ -3663,13 +3719,19 @@ fn send_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> Val
             thread_id: thread_id.to_string(),
             payload_digest,
             outcome,
+            queue_entry_id,
         },
     );
-    send_result(&request.request_id, outcome)
+    send_result(&request.request_id, outcome, queue_entry_id)
 }
 
-fn send_result(request_id: &str, outcome: &str) -> Value {
-    success(request_id, json!({"outcome": outcome, "provisional": true}))
+fn send_result(request_id: &str, outcome: &str, queue_entry_id: Option<usize>) -> Value {
+    success(
+        request_id,
+        json!({"outcome": outcome,
+        "native_request_id": request_id,
+        "queue_entry_id": queue_entry_id, "provisional": true}),
+    )
 }
 
 fn zedlink_error_value(

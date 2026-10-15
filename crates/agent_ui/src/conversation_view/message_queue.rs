@@ -5,10 +5,17 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueueEntryId(usize);
 
+impl QueueEntryId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
 pub struct QueueEntry {
     pub id: QueueEntryId,
     pub content: Vec<acp_v2::ContentBlock>,
     pub tracked_buffers: Vec<Entity<Buffer>>,
+    pub remote_request_id: Option<String>,
     /// When true, this message interrupts the agent at the next turn boundary
     /// instead of waiting for generation to fully complete. Only the front
     /// entry's value matters, since messages are delivered in FIFO order.

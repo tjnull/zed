@@ -622,6 +622,7 @@ pub struct ThreadView {
     _sandbox_status_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub current_submission: Option<SubmissionId>,
+    remote_submission: Option<(SubmissionId, String, usize)>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1061,6 +1062,7 @@ impl ThreadView {
             _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
             current_submission,
+            remote_submission: None,
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
@@ -2095,6 +2097,47 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.send_content_with_remote_origin(contents_task, is_native_command, None, window, cx);
+    }
+
+    pub(crate) fn send_content_from_remote(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        request_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_content_with_remote_origin(
+            contents_task,
+            is_native_command,
+            Some(request_id),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn remote_submission(&self) -> Option<(SubmissionId, &str, usize)> {
+        let (submission_id, request_id, entry_start_index) = self.remote_submission.as_ref()?;
+        (self.current_submission == Some(*submission_id)).then_some((
+            *submission_id,
+            request_id.as_str(),
+            *entry_start_index,
+        ))
+    }
+
+    fn send_content_with_remote_origin(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        remote_request_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2171,7 +2214,8 @@ impl ThreadView {
             }
 
             let turn_start_time = Instant::now();
-            let send = thread.update(cx, |thread, cx| {
+            let (send, entry_start_index) = thread.update(cx, |thread, cx| {
+                let entry_start_index = thread.entries().len();
                 thread.action_log().update(cx, |action_log, cx| {
                     for buffer in tracked_buffers {
                         action_log.buffer_read(buffer, cx)
@@ -2189,16 +2233,19 @@ impl ThreadView {
                     side = side
                 );
 
-                if is_native_command {
+                let send = if is_native_command {
                     thread.send_command(contents, cx)
                 } else {
                     thread.send(contents, cx)
-                }
+                };
+                (send, entry_start_index)
             })?;
             let submission_id = send.id;
 
             let _ = this.update(cx, |this, cx| {
                 this.current_submission = Some(submission_id);
+                this.remote_submission = remote_request_id
+                    .map(|request_id| (submission_id, request_id, entry_start_index));
                 this.sync_generating_indicator(cx);
                 cx.notify();
             });
@@ -2715,6 +2762,29 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.add_to_queue_with_remote_origin(content, tracked_buffers, None, window, cx);
+    }
+
+    pub(crate) fn add_to_queue_from_remote(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        request_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        self.add_to_queue_with_remote_origin(content, tracked_buffers, Some(request_id), window, cx)
+            .as_usize()
+    }
+
+    fn add_to_queue_with_remote_origin(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        tracked_buffers: Vec<Entity<Buffer>>,
+        remote_request_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> QueueEntryId {
         // The ID must be allocated up front so the editor event subscription
         // can capture it before the entry (which owns the subscription) exists.
         let id = self.message_queue.next_id();
@@ -2748,12 +2818,14 @@ impl ThreadView {
             id,
             content,
             tracked_buffers,
+            remote_request_id,
             steer: false,
             editor,
             _subscription: subscription,
         });
         self.sync_queue_flag_to_native_thread(cx);
         cx.notify();
+        id
     }
 
     fn handle_queue_editor_event(
@@ -2818,6 +2890,7 @@ impl ThreadView {
                     }
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
+                    entry.remote_request_id = None;
                 }
                 cx.notify();
             })?;
@@ -2930,6 +3003,7 @@ impl ThreadView {
 
         let content = entry.content;
         let tracked_buffers = entry.tracked_buffers;
+        let remote_request_id = entry.remote_request_id;
 
         // A queued message can itself be a built-in command (e.g. the user typed
         // `/compact` while a turn was generating). Detect that so we run it as a
@@ -2964,7 +3038,13 @@ impl ThreadView {
             Ok(Some((content, tracked_buffers)))
         });
 
-        self.send_content(contents_task, is_native_command, window, cx);
+        self.send_content_with_remote_origin(
+            contents_task,
+            is_native_command,
+            remote_request_id,
+            window,
+            cx,
+        );
     }
 
     pub fn move_queued_message_to_main_editor(
