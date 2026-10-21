@@ -3427,7 +3427,7 @@ The following settings can be overridden for each specific language:
 - [`soft_wrap`](#soft-wrap)
 - [`soft_wrap_indent`](#soft-wrap-indent)
 - [`tab_size`](#tab-size)
-- [`use_autoclose`](#use-autoclose)
+- [`use_autoclose`](#auto-close)
 - [`always_treat_brackets_as_autoclosed`](#always-treat-brackets-as-autoclosed)
 
 These values take in the same options as the root-level settings with the same name.
@@ -3562,6 +3562,16 @@ Positive `integer` values or `null` for unlimited tabs
 **Options**
 
 `boolean` values
+
+## Modeline Lines
+
+- Description: Number of lines to search for [modelines](../modelines.md) at the beginning and end of files
+- Setting: `modeline_lines`
+- Default: `5`
+
+**Options**
+
+Positive `integer` values, or `0` to disable modeline parsing
 
 ## Multi Cursor Modifier
 
@@ -6014,6 +6024,16 @@ Available variables:
 }
 ```
 
+5. Files are grouped by their last extension (case-insensitive) in ascending order, with extensionless files, including dotfiles such as `.gitignore`, first. Dotfiles with a further suffix, such as `.config.json`, keep that extension. Files with the same extension are sorted by name using natural sort, and directories are placed according to `sort_mode`.
+
+```json [settings]
+{
+  "project_panel": {
+    "sort_order": "extension"
+  }
+}
+```
+
 ### Auto Open
 
 - Description: Control whether files are opened automatically after different creation flows in the project panel.
@@ -6051,6 +6071,11 @@ Visit [AI Quick Start](../ai/quick-start.md) under the AI section to learn more 
 **Options**
 
 `boolean` values
+
+### Subagent Model {#agent-subagent-model}
+
+- Description: The model, reasoning, and speed settings for new Zed Agent subagents. This setting does not configure external agents. See [Subagent Models](../ai/agent-settings.md#subagent-models).
+- Setting: `agent.subagent_model`
 
 ## Collaboration Panel
 

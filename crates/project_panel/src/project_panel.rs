@@ -58,6 +58,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use svg_preview::svg_preview_view::SvgPreviewView;
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
@@ -87,7 +88,7 @@ use zed_actions::{
 
 use crate::{
     project_panel_settings::ProjectPanelScrollbarProxy,
-    undo::{Change, UndoManager},
+    undo::{Change, UndoManager, already_exists_error, project_path_display},
 };
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
@@ -449,6 +450,8 @@ actions!(
         OpenMarkdownPreview,
         /// Opens the context menu for the selected entry.
         OpenContextMenu,
+        /// Opens an SVG preview for the selected file.
+        OpenSvgPreview,
     ]
 );
 
@@ -1147,11 +1150,10 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
-            let is_markdown = !is_dir
-                && MarkdownPreviewView::is_markdown_path(
-                    entry.path.as_std_path(),
-                    project.languages(),
-                );
+            let file_name = Path::new(entry_file_name(entry, worktree.root_name()));
+            let is_markdown =
+                !is_dir && MarkdownPreviewView::is_markdown_path(file_name, project.languages());
+            let is_svg = !is_dir && SvgPreviewView::is_svg_path(file_name);
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1183,6 +1185,9 @@ impl ProjectPanel {
                         menu.when(is_markdown, |menu| {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                         })
+                        .when(is_svg, |menu| {
+                            menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                        })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
@@ -1202,6 +1207,9 @@ impl ProjectPanel {
                             .action("Open in Terminal", Box::new(OpenInTerminal))
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                            })
+                            .when(is_svg, |menu| {
+                                menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
@@ -1995,24 +2003,37 @@ impl ProjectPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((worktree, entry)) = self.selected_entry(cx) else {
+        let Some((project_path, file_name)) = self.selected_file(cx) else {
             return;
         };
-        if !entry.is_file()
-            || !MarkdownPreviewView::is_markdown_path(
-                entry.path.as_std_path(),
-                self.project.read(cx).languages(),
-            )
-        {
+        if !MarkdownPreviewView::is_markdown_path(
+            Path::new(file_name),
+            self.project.read(cx).languages(),
+        ) {
             return;
         }
-        let project_path = ProjectPath {
-            worktree_id: worktree.id(),
-            path: entry.path.clone(),
-        };
         self.workspace
             .update(cx, |workspace, cx| {
                 MarkdownPreviewView::open_for_project_path(project_path, workspace, window, cx);
+            })
+            .ok();
+    }
+
+    fn open_svg_preview(
+        &mut self,
+        _: &OpenSvgPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((project_path, file_name)) = self.selected_file(cx) else {
+            return;
+        };
+        if !SvgPreviewView::is_svg_path(Path::new(file_name)) {
+            return;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                SvgPreviewView::open_for_project_path(project_path, workspace, window, cx)
             })
             .ok();
     }
@@ -2655,7 +2676,7 @@ impl ProjectPanel {
 
                 let task = panel.update(cx, |_panel, cx| {
                     repository.update(cx, |repo, cx| {
-                        repo.checkout_files("HEAD", vec![repo_path], cx)
+                        repo.checkout_files(Some("HEAD"), vec![repo_path], cx)
                     })
                 })?;
 
@@ -4054,14 +4075,20 @@ impl ProjectPanel {
     }
 
     fn selected_file_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        self.selected_file(cx).map(|(project_path, _)| project_path)
+    }
+
+    fn selected_file<'a>(&self, cx: &'a App) -> Option<(ProjectPath, &'a str)> {
         let (worktree, entry) = self.selected_sub_entry(cx)?;
         if entry.is_dir() {
             return None;
         }
-        Some(ProjectPath {
-            worktree_id: worktree.read(cx).id(),
+        let worktree = worktree.read(cx);
+        let project_path = ProjectPath {
+            worktree_id: worktree.id(),
             path: entry.path.clone(),
-        })
+        };
+        Some((project_path, entry_file_name(entry, worktree.root_name())))
     }
 
     fn reveal_in_finder(
@@ -4240,12 +4267,12 @@ impl ProjectPanel {
         destination_entry: ProjectEntryId,
         destination_is_file: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<Result<CreatedEntry>>> {
+    ) -> Option<(ProjectPath, Task<Result<CreatedEntry>>)> {
         if entry_to_move == destination_entry {
             return None;
         }
 
-        let (destination_worktree, rename_task) = self.project.update(cx, |project, cx| {
+        let (destination_worktree, rename) = self.project.update(cx, |project, cx| {
             let Some(source_path) = project.path_for_entry(entry_to_move, cx) else {
                 return (None, None);
             };
@@ -4269,24 +4296,20 @@ impl ProjectPanel {
 
             let mut new_path = destination_dir.to_rel_path_buf();
             new_path.push(source_name);
-            let rename_task = (new_path.as_rel_path() != source_path.path.as_ref()).then(|| {
-                project.rename_entry(
-                    entry_to_move,
-                    (destination_worktree_id, new_path).into(),
-                    cx,
-                )
+
+            let new_project_path: ProjectPath = (destination_worktree_id, new_path).into();
+            let rename = (new_project_path.path.as_ref() != source_path.path.as_ref()).then(|| {
+                let task = project.rename_entry(entry_to_move, new_project_path.clone(), cx);
+                (new_project_path, task)
             });
 
-            (
-                project.worktree_id_for_entry(destination_entry, cx),
-                rename_task,
-            )
+            (project.worktree_id_for_entry(destination_entry, cx), rename)
         });
 
         if let Some(destination_worktree) = destination_worktree {
             self.expand_entry(destination_worktree, destination_entry, cx);
         }
-        rename_task
+        rename
     }
 
     fn index_for_selection(&self, selection: SelectedEntry) -> Option<(usize, usize, usize)> {
@@ -5330,14 +5353,25 @@ impl ProjectPanel {
                 .worktree_for_entry(target_entry_id, cx)
                 .map(|wt| wt.read(cx).id());
 
-            // Collect move tasks paired with their source entry ID so we can correlate
-            // results with folded selections that need refreshing.
-            let mut move_tasks: Vec<(ProjectEntryId, Task<Result<CreatedEntry>>)> = Vec::new();
+            let path_style = self.project.read(cx).path_style(cx);
+
+            let mut move_tasks: Vec<(
+                ProjectEntryId,
+                Option<(String, String)>,
+                Task<Result<CreatedEntry>>,
+            )> = Vec::new();
             for entry in entries {
-                if let Some(task) =
+                if let Some((destination, task)) =
                     self.move_worktree_entry(entry.entry_id, target_entry_id, is_file, cx)
                 {
-                    move_tasks.push((entry.entry_id, task));
+                    let names = old_paths.get(&entry.entry_id).map(|from| {
+                        let project = self.project.read(cx);
+                        (
+                            project_path_display(project, from, path_style, cx),
+                            project_path_display(project, &destination, path_style, cx),
+                        )
+                    });
+                    move_tasks.push((entry.entry_id, names, task));
                 }
             }
 
@@ -5349,9 +5383,10 @@ impl ProjectPanel {
             if folded_selection_info.is_empty() {
                 cx.spawn_in(window, async move |project_panel, mut cx| {
                     let mut changes = Vec::new();
-                    for (entry_id, task) in move_tasks {
+                    for (entry_id, names, task) in move_tasks {
                         if let Some(CreatedEntry::Included(new_entry)) = task
                             .await
+                            .map_err(|err| explain_move_error(err, names.as_ref()))
                             .notify_workspace_async_err(workspace.clone(), &mut cx)
                         {
                             if let (Some(old_path), Some(worktree_id)) =
@@ -5376,9 +5411,10 @@ impl ProjectPanel {
                     // Await all move tasks and collect successful results
                     let mut move_results: Vec<(ProjectEntryId, Entry)> = Vec::new();
                     let mut operations = Vec::new();
-                    for (entry_id, task) in move_tasks {
+                    for (entry_id, names, task) in move_tasks {
                         if let Some(CreatedEntry::Included(new_entry)) = task
                             .await
+                            .map_err(|err| explain_move_error(err, names.as_ref()))
                             .notify_workspace_async_err(workspace.clone(), &mut cx)
                         {
                             if let (Some(old_path), Some(worktree_id)) =
@@ -7082,11 +7118,7 @@ impl ProjectPanel {
                     suffix.display(path_style).to_string()
                 })
         } else {
-            entry
-                .path
-                .file_name()
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| root_name.as_unix_str().to_string())
+            entry_file_name(entry, root_name).to_string()
         };
 
         let selection = SelectedEntry {
@@ -7440,6 +7472,14 @@ impl StickyCandidate for StickyProjectPanelCandidate {
     }
 }
 
+/// A single-file worktree's root entry has an empty path, so its name is the worktree's root name.
+fn entry_file_name<'a>(entry: &'a Entry, root_name: &'a RelPath) -> &'a str {
+    entry
+        .path
+        .file_name()
+        .unwrap_or_else(|| root_name.as_unix_str())
+}
+
 fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -> usize {
     const ICON_SIZE_FACTOR: usize = 2;
     let mut item_width = depth * ICON_SIZE_FACTOR + item_text_chars;
@@ -7606,6 +7646,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_vertical))
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
+                .on_action(cx.listener(Self::open_svg_preview))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
@@ -7891,7 +7932,7 @@ impl Render for ProjectPanel {
                                     cx,
                                 )
                                 .flex_grow_1()
-                                .on_scroll_wheel({
+                                .on_scroll({
                                     let scroll_handle = self.scroll_handle.clone();
                                     let entity_id = cx.entity().entity_id();
                                     move |event, window, cx| {
@@ -8347,6 +8388,15 @@ fn git_status_indicator(git_status: GitSummary) -> Option<(&'static str, Color)>
         return Some(("A", Color::Created));
     }
     None
+}
+
+fn explain_move_error(err: anyhow::Error, names: Option<&(String, String)>) -> anyhow::Error {
+    match names {
+        Some((from, to)) if already_exists_error(&err) => err.context(format!(
+            "Failed to move `{from}` to `{to}`. A file or folder already exists there."
+        )),
+        _ => err,
+    }
 }
 
 #[cfg(test)]
