@@ -4108,8 +4108,13 @@ impl AcpThread {
         }
     }
 
-    pub fn current_turn_id(&self) -> Option<u32> {
-        self.running_turn.as_ref().map(|turn| turn.id)
+    pub fn current_turn_id(&self) -> Option<u64> {
+        if let Some(turn) = &self.running_turn {
+            return Some(u64::from(turn.id));
+        }
+        // Receipt submissions report a foreground generation instead of owning a running_turn.
+        (self.uses_reported_activity() && self.foreground_activity().is_active())
+            .then(|| self.activity.generation())
     }
 
     /// Whether the agent reports this session's foreground state, rather than Zed

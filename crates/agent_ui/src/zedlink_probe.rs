@@ -1717,12 +1717,7 @@ fn approval_response(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -
     let Some(approval_id) = request.params.get("approval_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    let Some(turn_id) = request
-        .params
-        .get("turn_id")
-        .and_then(Value::as_u64)
-        .and_then(|id| u32::try_from(id).ok())
-    else {
+    let Some(turn_id) = request.params.get("turn_id").and_then(Value::as_u64) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
     if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
@@ -1888,12 +1883,7 @@ fn cancel_request(request: &ProbeRequest, state: &ProbeState, cx: &mut App) -> V
     let Some(thread_id) = request.params.get("thread_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    let Some(turn_id) = request
-        .params
-        .get("turn_id")
-        .and_then(Value::as_u64)
-        .and_then(|id| u32::try_from(id).ok())
-    else {
+    let Some(turn_id) = request.params.get("turn_id").and_then(Value::as_u64) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
     if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
@@ -1960,12 +1950,7 @@ fn cancel_subagent_request(request: &ProbeRequest, state: &ProbeState, cx: &mut 
     let Some(subagent_id) = request.params.get("subagent_id").and_then(Value::as_str) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
-    let Some(turn_id) = request
-        .params
-        .get("turn_id")
-        .and_then(Value::as_u64)
-        .and_then(|id| u32::try_from(id).ok())
-    else {
+    let Some(turn_id) = request.params.get("turn_id").and_then(Value::as_u64) else {
         return error(&request.request_id, "INVALID_REQUEST");
     };
     if request.params.get("instance_id").and_then(Value::as_str) != Some(state.instance_id.as_str())
