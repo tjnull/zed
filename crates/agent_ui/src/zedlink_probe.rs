@@ -186,6 +186,7 @@ impl ProbePermissions {
         let mut capabilities = vec![
             "thread.list",
             "thread.snapshot",
+            "thread.snapshot.delta",
             "thread.history",
             "thread.events",
             "thread.commands",
@@ -550,6 +551,12 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
         let id = id.clone();
         move |thread, event: &AcpThreadEvent, cx| {
             let activity = thread_activity_value(thread.read(cx));
+            let entry_index = match event {
+                AcpThreadEvent::NewEntry => thread.read(cx).entries().len().checked_sub(1),
+                AcpThreadEvent::EntryUpdated(index) => Some(*index),
+                AcpThreadEvent::EntriesRemoved(range) => Some(range.start),
+                _ => None,
+            };
             let mut events = state.events.borrow_mut();
             let record = events.entry(id.clone()).or_default();
             let Some(sequence) = record.last_sequence.checked_add(1) else {
@@ -560,6 +567,7 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
                 "sequence": sequence,
                 "kind": event_kind(event),
                 "activity": activity,
+                "entry_index": entry_index,
             }));
             if record.records.len() > 256 {
                 record.records.pop_front();
@@ -753,6 +761,43 @@ fn transcript_page(
     entry_meta.reverse();
     let start = end.saturating_sub(entries.len());
     (start, end, entries, entry_meta)
+}
+
+fn transcript_delta_start(
+    params: &Value,
+    events: Option<&ThreadEvents>,
+    total_entries: usize,
+) -> Option<usize> {
+    let after_sequence = params.get("after_sequence")?.as_u64()?;
+    let known_start = usize::try_from(params.get("entry_start_index")?.as_u64()?).ok()?;
+    let known_end = usize::try_from(params.get("entry_end_index")?.as_u64()?).ok()?;
+    if known_start > known_end || known_end > total_entries {
+        return None;
+    }
+    let events = events?;
+    if after_sequence > events.last_sequence
+        || (after_sequence < events.last_sequence && events.records.is_empty())
+        || events.records.front().is_some_and(|record| {
+            after_sequence.saturating_add(1) < record["sequence"].as_u64().unwrap_or(0)
+        })
+    {
+        return None;
+    }
+    let mut start = known_end;
+    for record in events.records.iter().filter(|record| {
+        record["sequence"]
+            .as_u64()
+            .is_some_and(|sequence| sequence > after_sequence)
+    }) {
+        match record["kind"].as_str() {
+            Some("entry.added" | "entry.updated") => {
+                start = start.min(usize::try_from(record["entry_index"].as_u64()?).ok()?);
+            }
+            Some("entry.removed") => return None,
+            _ => {}
+        }
+    }
+    (start >= known_start).then_some(start)
 }
 
 pub(crate) fn is_available(cx: &App) -> bool {
@@ -970,8 +1015,33 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     })
                 })
                 .collect::<Vec<_>>();
-            let (entry_start_index, entry_end_index, entries, entry_meta) =
-                transcript_page(thread, total_entries, tail_entry_count, cx);
+            let delta_start = if matches_instance(&request, state) {
+                transcript_delta_start(
+                    &request.params,
+                    state.events.borrow().get(id),
+                    total_entries,
+                )
+            } else {
+                None
+            };
+            let delta_count = delta_start.map(|start| total_entries.saturating_sub(start));
+            let (entry_start_index, entry_end_index, entries, entry_meta, delta_used) =
+                match delta_count.filter(|count| *count <= MAX_TRANSCRIPT_PAGE_ENTRIES) {
+                    Some(0) => (total_entries, total_entries, Vec::new(), Vec::new(), true),
+                    Some(count) => {
+                        let page = transcript_page(thread, total_entries, count, cx);
+                        if Some(page.0) == delta_start {
+                            (page.0, page.1, page.2, page.3, true)
+                        } else {
+                            let page = transcript_page(thread, total_entries, tail_entry_count, cx);
+                            (page.0, page.1, page.2, page.3, false)
+                        }
+                    }
+                    None => {
+                        let page = transcript_page(thread, total_entries, tail_entry_count, cx);
+                        (page.0, page.1, page.2, page.3, false)
+                    }
+                };
             let truncated = entry_start_index > 0;
             // Retain the older activity projection for compatible clients. Updated clients
             // render the indexed transcript tail directly and request a smaller live tail.
@@ -1022,6 +1092,7 @@ fn handle_request(request: ProbeRequest, state: &ProbeState, cx: &mut App) -> Va
                     "pending_approvals": pending_approvals(thread, cx),
                     "subagents": subagent_snapshots(thread, server_view.as_ref(), cx),
                     "entries_markdown": entries,
+                    "delta": delta_used,
                     "entries_meta": entry_meta,
                     "entry_start_index": entry_start_index,
                     "entry_end_index": entry_end_index,
