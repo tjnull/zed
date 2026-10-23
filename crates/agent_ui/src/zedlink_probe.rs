@@ -566,6 +566,19 @@ fn expose_thread(state: &Rc<ProbeState>, thread: &Entity<AcpThread>, cx: &mut Ap
             record.records.push_back(json!({
                 "sequence": sequence,
                 "kind": event_kind(event),
+                "stop_reason": match event {
+                    AcpThreadEvent::Stopped { stop_reason, .. } => Some(match stop_reason {
+                        Some(acp::StopReason::EndTurn) => "completed",
+                        Some(acp::StopReason::Cancelled) => "cancelled",
+                        Some(acp::StopReason::MaxTokens) => "max_tokens",
+                        Some(acp::StopReason::MaxTurnRequests) => "max_turn_requests",
+                        Some(acp::StopReason::Refusal) => "refusal",
+                        Some(acp::StopReason::Error(_)) => "error",
+                        None => "unknown",
+                        _ => "other",
+                    }),
+                    _ => None,
+                },
                 "activity": activity,
                 "entry_index": entry_index,
             }));
