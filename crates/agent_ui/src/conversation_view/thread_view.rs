@@ -2183,6 +2183,18 @@ impl ThreadView {
             return;
         }
 
+        let draft = self.message_editor.read(cx).text(cx);
+        if let Some(command) = self
+            .available_local_commands(cx)
+            .into_iter()
+            .find(|command| draft.trim() == format!("/{}", command.keyword()))
+        {
+            self.message_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+            self.run_local_command(command, window, cx);
+            return;
+        }
+
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);

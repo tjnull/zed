@@ -3105,6 +3105,39 @@ mod tests {
             invoked.borrow().as_slice(),
             &[PromptLocalCommand::ThumbsDown],
         );
+
+        #[cfg(unix)]
+        {
+            message_editor.read_with(&cx, |message_editor, _| {
+                message_editor.set_local_commands(vec![PromptLocalCommand::RemoteControl]);
+            });
+            cx.simulate_input("/remo");
+            cx.run_until_parked();
+
+            editor.read_with(&cx, |editor, _| {
+                assert!(editor.has_visible_completions_menu());
+                assert_eq!(
+                    current_completion_labels(editor),
+                    &[PromptLocalCommand::RemoteControl.label().to_string()],
+                );
+            });
+            editor.update_in(&mut cx, |editor, window, cx| {
+                editor.compose_completion(
+                    &editor::actions::ComposeCompletion::default(),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+
+            editor.read_with(&cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "/remote-control");
+            });
+            assert_eq!(
+                invoked.borrow().as_slice(),
+                &[PromptLocalCommand::ThumbsDown]
+            );
+        }
     }
 
     /// Opening slash-command autocomplete must emit
