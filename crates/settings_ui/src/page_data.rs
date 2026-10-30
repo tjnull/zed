@@ -743,26 +743,55 @@ fn manage_zedlink_devices(window: &mut gpui::Window, cx: &mut App) {
                 .ok();
                 return anyhow::Ok(());
             }
-            let mut answers = devices
-                .iter()
-                .map(|(_, name)| PromptButton::new(format!("Revoke {name}")))
-                .collect::<Vec<_>>();
-            answers.push(PromptButton::cancel("Cancel"));
-            let prompt = cx.prompt(
-                PromptLevel::Info,
-                "Paired ZedLink devices",
-                Some("Select a device to revoke its browser credential. This does not delete Zed conversations."),
-                &answers,
-            );
-            let Ok(index) = prompt.await else {
-                return anyhow::Ok(());
+            let page_size = 6;
+            let page_count = devices.len().div_ceil(page_size);
+            let mut page = 0;
+            let (device_id, device_name) = loop {
+                let start = page * page_size;
+                let end = (start + page_size).min(devices.len());
+                let mut answers = devices[start..end]
+                    .iter()
+                    .map(|(id, name)| {
+                        let suffix = id.rsplit('-').next().unwrap_or(id.as_str());
+                        PromptButton::new(format!("{name} · {suffix}"))
+                    })
+                    .collect::<Vec<_>>();
+                let previous_index = (page > 0).then(|| {
+                    let index = answers.len();
+                    answers.push(PromptButton::new("Previous page"));
+                    index
+                });
+                let next_index = (page + 1 < page_count).then(|| {
+                    let index = answers.len();
+                    answers.push(PromptButton::new("Next page"));
+                    index
+                });
+                answers.push(PromptButton::cancel("Close"));
+                let title = format!("Authorized devices · page {} of {page_count}", page + 1);
+                let description = format!(
+                    "{} existing device credentials. Select one to review revocation. To connect a new phone, close this list and choose Open Browser QR. The ID suffix distinguishes devices with the same name.",
+                    devices.len()
+                );
+                let Ok(index) = cx.prompt(PromptLevel::Info, &title, Some(&description), &answers).await else {
+                    return anyhow::Ok(());
+                };
+                if Some(index) == previous_index {
+                    page -= 1;
+                    continue;
+                }
+                if Some(index) == next_index {
+                    page += 1;
+                    continue;
+                }
+                let Some(device) = devices[start..end].get(index) else {
+                    return anyhow::Ok(());
+                };
+                break device.clone();
             };
-            let Some((device_id, device_name)) = devices.get(index).cloned() else {
-                return anyhow::Ok(());
-            };
+            let suffix = device_id.rsplit('-').next().unwrap_or(device_id.as_str());
             let confirmation = cx.prompt(
                 PromptLevel::Warning,
-                &format!("Revoke {device_name}?"),
+                &format!("Revoke {device_name} · {suffix}?"),
                 Some("This browser or installed app must pair again before it can access ZedLink."),
                 &[
                     PromptButton::ok("Revoke Device"),
@@ -1135,7 +1164,7 @@ fn zedlink_page() -> SettingsPage {
                         SettingsPageItem::SectionHeader("Device Access"),
                         SettingsPageItem::ActionLink(ActionLink {
                             title: "Pair New Device".into(),
-                            description: Some("Create a private, five-minute pairing page with a QR code and manual code for phones, tablets, and desktop browsers.".into()),
+                            description: Some("Show the current HTTPS gateway address and identity, plus a five-minute QR and manual code for a new phone or browser.".into()),
                             button_text: "Open Browser QR".into(),
                             on_click: Arc::new(|_, window, cx| run_zedlink_manager_action("pair-primary", window, cx)),
                             files: USER,
@@ -1149,8 +1178,8 @@ fn zedlink_page() -> SettingsPage {
                         }),
                         SettingsPageItem::ActionLink(ActionLink {
                             title: "View or Revoke Paired Devices".into(),
-                            description: Some("List browsers and installed web apps authorized by this gateway, then optionally revoke one device after confirmation.".into()),
-                            button_text: "Manage Devices".into(),
+                            description: Some("Review existing authorized browsers and apps in a paged list. Select one only if you want to revoke its credential; new pairing uses Open Browser QR above.".into()),
+                            button_text: "Review Devices".into(),
                             on_click: Arc::new(|_, window, cx| manage_zedlink_devices(window, cx)),
                             files: USER,
                         }),

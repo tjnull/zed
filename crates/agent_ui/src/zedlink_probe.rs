@@ -745,6 +745,10 @@ fn transcript_entry_meta(entry: &AgentThreadEntry, cx: &App) -> Value {
                 "status": status,
             })
         }
+        AgentThreadEntry::Elicitation(id) => json!({
+            "kind": "elicitation",
+            "elicitation_id": id.0.as_ref(),
+        }),
         _ => json!({"kind": "other"}),
     }
 }
